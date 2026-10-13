@@ -1,0 +1,22 @@
+name: Test installer
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Run ShellCheck
+        run: shellcheck install.sh tests/test.sh
+
+      - name: Run installer unit tests
+        run: bash tests/test.sh
