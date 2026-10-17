@@ -134,15 +134,14 @@ ensure_runtime_tools() {
 }
 
 port_in_use() {
-  local port="$1" hex_port table
-  hex_port=$(printf '%04X' "$port")
-  for table in /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6; do
-    [[ -r "$table" ]] || continue
-    if awk -v suffix=":${hex_port}" 'NR > 1 && substr($2, length($2) - 4) == suffix { found=1 } END { exit !found }' "$table"; then
-      return 0
-    fi
-  done
-  return 1
+  local port="$1"
+  # Only treat listening TCP sockets and bound UDP sockets as occupied.
+  # The former /proc-based check could incorrectly flag non-listening sockets.
+  command -v ss >/dev/null 2>&1 || die '缺少 ss 命令（通常由 iproute2 软件包提供）'
+  ss -H -lntu | awk -v port="$port" '
+    $5 ~ (":" port "$") { found=1; exit }
+    END { exit !found }
+  '
 }
 
 preflight_ports_and_existing_install() {
