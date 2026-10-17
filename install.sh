@@ -3,8 +3,6 @@ set -Eeuo pipefail
 
 umask 077
 
-readonly DEFAULT_NZ_SERVER='rc.010199.xyz:18181'
-readonly DEFAULT_NZ_TLS='false'
 readonly XUI_VERSION='0.3.2'
 readonly XUI_USERNAME='wochiniming'
 readonly XUI_PASSWORD='wochiniming'
@@ -12,11 +10,9 @@ readonly XUI_PANEL_PORT='18181'
 readonly DEFAULT_SS_PORT='80'
 readonly SS_METHOD='aes-256-gcm'
 readonly SS_REMARK='independent-ip'
-readonly NEZHA_INSTALL_URL='https://raw.githubusercontent.com/nezhahq/scripts/main/agent/install.sh'
 readonly XUI_INSTALL_URL='https://raw.githubusercontent.com/vaxilu/x-ui/master/install.sh'
 
 WORK_DIR=''
-INSTALL_NEZHA='false'
 SS_PORT="$DEFAULT_SS_PORT"
 
 log() {
@@ -80,20 +76,8 @@ is_valid_port() {
 collect_choices() {
   local custom_port
 
-  printf '\nLinux Nezha Agent + x-ui + Shadowsocks 一键安装\n'
+  printf '\nLinux x-ui + Shadowsocks 一键安装\n'
   printf '%s\n' '--------------------------------------------------'
-
-  if prompt_yes_no '是否安装 Nezha Agent？' 'yes'; then
-    INSTALL_NEZHA='true'
-    if [[ -z "${NZ_CLIENT_SECRET:-}" ]]; then
-      read -r -s -p '请输入 NZ_CLIENT_SECRET（输入不显示）: ' NZ_CLIENT_SECRET || die '无法读取 NZ_CLIENT_SECRET'
-      printf '\n'
-    fi
-    [[ -n "${NZ_CLIENT_SECRET:-}" ]] || die 'NZ_CLIENT_SECRET 不能为空'
-  else
-    INSTALL_NEZHA='false'
-    NZ_CLIENT_SECRET=''
-  fi
 
   if prompt_yes_no 'Shadowsocks 是否使用默认端口 80？' 'yes'; then
     SS_PORT="$DEFAULT_SS_PORT"
@@ -111,7 +95,8 @@ collect_choices() {
     done
   fi
 
-  printf '选择完成：Nezha Agent=%s，Shadowsocks 端口=%s\n\n' "$INSTALL_NEZHA" "$SS_PORT"
+  printf '选择完成：x-ui 面板端口=%s，Shadowsocks 协议=%s，端口=%s\n\n' \
+    "$XUI_PANEL_PORT" "$SS_METHOD" "$SS_PORT"
 }
 
 install_package() {
@@ -178,17 +163,9 @@ preflight_ports_and_existing_install() {
 }
 
 validate_inputs() {
-  NZ_SERVER="${NZ_SERVER:-$DEFAULT_NZ_SERVER}"
-  NZ_TLS="${NZ_TLS:-$DEFAULT_NZ_TLS}"
-  NZ_CLIENT_SECRET="${NZ_CLIENT_SECRET:-}"
   PUBLIC_HOST="${PUBLIC_HOST:-}"
   SS_PASSWORD="${SS_PASSWORD:-}"
 
-  if [[ "$INSTALL_NEZHA" == 'true' ]]; then
-    [[ -n "$NZ_CLIENT_SECRET" ]] || die '选择安装 Nezha Agent 时 NZ_CLIENT_SECRET 不能为空'
-  fi
-  [[ "$NZ_TLS" == 'true' || "$NZ_TLS" == 'false' ]] || die 'NZ_TLS 只能是 true 或 false'
-  [[ "$NZ_SERVER" != *$'\n'* ]] || die 'NZ_SERVER 不能包含换行'
   if [[ -n "$PUBLIC_HOST" ]] && ! is_ipv4 "$PUBLIC_HOST"; then
     die 'PUBLIC_HOST 必须是有效的公网 IPv4 地址'
   fi
@@ -209,25 +186,6 @@ download_file() {
     --retry 3 --retry-delay 2 --connect-timeout 20 \
     "$url" -o "$destination"
   [[ -s "$destination" ]] || die "下载结果为空：$url"
-}
-
-install_nezha_agent() {
-  local script="$WORK_DIR/nezha-agent-install.sh"
-
-  log "下载并安装 Nezha Agent，服务端为 $NZ_SERVER"
-  download_file "$NEZHA_INSTALL_URL" "$script"
-  chmod 700 "$script"
-  env NZ_SERVER="$NZ_SERVER" NZ_TLS="$NZ_TLS" NZ_CLIENT_SECRET="$NZ_CLIENT_SECRET" "$script"
-
-  [[ -x /opt/nezha/agent/nezha-agent ]] || die 'Nezha Agent 安装后未找到 /opt/nezha/agent/nezha-agent'
-  for _ in $(seq 1 20); do
-    if systemctl is-active --quiet nezha-agent.service 2>/dev/null || \
-      systemctl list-units --type=service --state=running --no-legend 2>/dev/null | grep -Eqi 'nezha.*agent'; then
-      return 0
-    fi
-    sleep 1
-  done
-  die 'Nezha Agent 服务安装后没有进入 running 状态'
 }
 
 install_xui() {
@@ -417,12 +375,7 @@ main() {
   ensure_runtime_tools
   preflight_ports_and_existing_install
 
-  WORK_DIR=$(mktemp -d /tmp/linux-nezha-xui.XXXXXX)
-  if [[ "$INSTALL_NEZHA" == 'true' ]]; then
-    install_nezha_agent
-  else
-    log '已按选择跳过 Nezha Agent'
-  fi
+  WORK_DIR=$(mktemp -d /tmp/linux-xui-ss.XXXXXX)
   install_xui
   wait_for_panel
   create_shadowsocks_inbound

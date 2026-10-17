@@ -1,12 +1,12 @@
-# Linux Nezha Agent + x-ui 独立 IP 一键安装
+# Linux x-ui + Shadowsocks 独立 IP 一键安装
 
 为普通 Linux 服务器一次性安装：
 
 - `unzip`（不存在时自动安装）
-- 可选安装官方 Nezha Agent，连接 `rc.010199.xyz:18181`，`NZ_TLS=false`
 - `vaxilu/x-ui` `0.3.2`
 - x-ui 面板：端口 `18181`，账号和密码均为 `wochiniming`
-- Shadowsocks：默认端口 `80`（可交互改成自定义端口），`aes-256-gcm`，TCP+UDP
+- 默认节点协议：Shadowsocks
+- Shadowsocks：默认端口 `80`（可交互改成自定义端口），加密方式 `aes-256-gcm`，TCP+UDP
 - 自动输出 `ss://` 链接和 Clash/OpenClash 节点 YAML
 
 ## 使用
@@ -19,10 +19,7 @@
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/abxian/linux-nezha-xui-installer/main/install.sh)"
 ```
 
-执行后会依次询问：
-
-- 是否安装 Nezha Agent；选择安装时，无回显输入 `NZ_CLIENT_SECRET`
-- Shadowsocks 是否使用默认端口 `80`；选择否时输入自定义端口
+执行时只询问 Shadowsocks 是否使用默认端口 `80`；选择否时可输入自定义端口。脚本不安装 Nezha Agent，也不读取任何 Nezha 密钥。
 
 脚本会自动检测服务器公网 IPv4，并随机生成 32 位十六进制 Shadowsocks 密码。
 
@@ -48,20 +45,19 @@ sudo bash install.sh
 - `18181/tcp`：x-ui 面板
 - `80/tcp`、`80/udp`：Shadowsocks
 
-云服务器还需要在云安全组中放行同样端口。Nezha Agent 连接的远端 `rc.010199.xyz:18181` 是出站连接，与本机 x-ui 监听 `18181` 不冲突。
+云服务器还需要在云安全组中放行同样端口。若选择了自定义 Shadowsocks 端口，请放行实际选择的 TCP 和 UDP 端口。
 
 ## 重要说明
 
 - `vaxilu/x-ui` 最新发布 `0.3.2` 来自 2021 年，已经非常旧。本仓库按指定来源固定该版本，不代表它适合长期暴露在公网。
 - 固定弱口令 `wochiniming` 是明确的部署要求。建议至少用云防火墙限制 `18181/tcp` 只允许管理 IP 访问。
-- `NZ_CLIENT_SECRET` 不写入 Git 历史；仅在选择安装 Nezha 时由终端无回显读取，再交给官方安装器。
+- 本脚本仅安装 x-ui 并创建 Shadowsocks 节点，不包含 Nezha Agent 功能。
 - 安装前若检测到已有 x-ui，或所选 SS 端口/18181 已占用，脚本会停止，避免覆盖现有服务。
 - 本脚本会安装服务并修改启用中的 UFW/firewalld，建议先在新服务器上使用。
 
 ## 验证
 
 ```bash
-sudo systemctl status nezha-agent --no-pager || sudo systemctl status nezha-agent.service --no-pager
 sudo systemctl status x-ui --no-pager
 sudo cat /root/independent-ip-node.txt
 sudo cat /root/independent-ip-clash.yaml
@@ -69,9 +65,8 @@ sudo cat /root/independent-ip-clash.yaml
 
 ## 卸载
 
-x-ui 可运行 `x-ui uninstall`。Nezha Agent 的服务名和安装位置由官方安装器决定；卸载前先查看对应 systemd unit，并保留 `/root/independent-ip-node.txt` 作为节点记录。
+x-ui 可运行 `x-ui uninstall`。卸载前请保留 `/root/independent-ip-node.txt` 作为节点记录，并按需撤销主机防火墙和云安全组规则。
 
 ## 上游来源
 
-- Nezha Agent 安装器：<https://github.com/nezhahq/scripts/blob/main/agent/install.sh>
 - x-ui：<https://github.com/vaxilu/x-ui>（固定 release `0.3.2`）

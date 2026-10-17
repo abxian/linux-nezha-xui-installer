@@ -36,19 +36,12 @@ if is_valid_port '0' || is_valid_port '65536' || is_valid_port 'abc'; then
   exit 1
 fi
 
-INSTALL_NEZHA='unset'
 SS_PORT='unset'
-NZ_CLIENT_SECRET=''
-collect_choices <<< $'n\ny\n'
-assert_eq 'false' "$INSTALL_NEZHA" 'Nezha should be optional'
+collect_choices <<< $'y\n'
 assert_eq '80' "$SS_PORT" 'SS should use port 80 by default'
 
-INSTALL_NEZHA='unset'
 SS_PORT='unset'
-NZ_CLIENT_SECRET=''
-collect_choices <<< $'y\ntest-secret\nn\n8388\n'
-assert_eq 'true' "$INSTALL_NEZHA" 'Nezha should be enabled when selected'
-assert_eq 'test-secret' "$NZ_CLIENT_SECRET" 'Nezha secret should be read interactively'
+collect_choices <<< $'n\n8388\n'
 assert_eq '8388' "$SS_PORT" 'Custom SS port should be accepted'
 
 mock_dir=$(mktemp -d)
@@ -98,11 +91,12 @@ grep -q "readonly XUI_PANEL_PORT='18181'" "$REPO_DIR/install.sh"
 grep -q "readonly DEFAULT_SS_PORT='80'" "$REPO_DIR/install.sh"
 grep -q "readonly XUI_USERNAME='wochiniming'" "$REPO_DIR/install.sh"
 grep -q "readonly XUI_PASSWORD='wochiniming'" "$REPO_DIR/install.sh"
-grep -q "read -r -s -p '请输入 NZ_CLIENT_SECRET" "$REPO_DIR/install.sh"
+grep -q "readonly SS_METHOD='aes-256-gcm'" "$REPO_DIR/install.sh"
+grep -q "protocol=shadowsocks" "$REPO_DIR/install.sh"
 
-if grep -Eq 'NZ_CLIENT_SECRET=[A-Za-z0-9_-]{20,}' "$REPO_DIR/install.sh" "$REPO_DIR/README.md"; then
-  printf 'FAIL: a plaintext Nezha secret pattern was found\n' >&2
+if grep -Eiq 'nezha|NZ_CLIENT_SECRET|NZ_SERVER|NZ_TLS' "$REPO_DIR/install.sh"; then
+  printf 'FAIL: Nezha functionality or configuration is still present\n' >&2
   exit 1
 fi
 
-printf 'PASS: syntax, choices, port validation, URI generation, x-ui API request, and secret scan\n'
+printf 'PASS: syntax, x-ui defaults, port choices, URI generation, API request, and Nezha removal\n'
