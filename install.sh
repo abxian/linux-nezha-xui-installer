@@ -3,16 +3,22 @@ set -Eeuo pipefail
 umask 077
 
 readonly XUI_VERSION='0.3.2'
-readonly XUI_USERNAME='wochiniming'
-readonly XUI_PASSWORD='wochiniming'
-readonly XUI_PANEL_PORT='18181'
+DEFAULT_XUI_USERNAME='wochiniming'
+DEFAULT_XUI_PASSWORD='wochiniming'
+DEFAULT_XUI_PANEL_PORT='18181'
 readonly DEFAULT_SS_PORT='80'
-readonly SS_METHOD='aes-256-gcm'
+DEFAULT_SS_METHOD='aes-256-gcm'
 readonly SS_REMARK='independent-ip'
 readonly XUI_INSTALL_URL='https://raw.githubusercontent.com/vaxilu/x-ui/master/install.sh'
 
 WORK_DIR=''
+XUI_USERNAME="$DEFAULT_XUI_USERNAME"
+XUI_PASSWORD="$DEFAULT_XUI_PASSWORD"
+XUI_PANEL_PORT="$DEFAULT_XUI_PANEL_PORT"
 SS_PORT="$DEFAULT_SS_PORT"
+SS_METHOD="$DEFAULT_SS_METHOD"
+PUBLIC_HOST="${PUBLIC_HOST:-}"
+SS_PASSWORD="${SS_PASSWORD:-}"
 
 log() { printf '[installer] %s\n' "$*"; }
 warn() { printf '[installer] WARNING: %s\n' "$*" >&2; }
@@ -34,50 +40,59 @@ require_root_linux_systemd() {
   esac
 }
 
-prompt_yes_no() {
-  local prompt="$1" default_answer="$2" answer
-  while true; do
-    if [[ "$default_answer" == 'yes' ]]; then
-      read -r -p "$prompt [Y/n]: " answer || die '无法读取交互输入'
-      answer="${answer:-y}"
-    else
-      read -r -p "$prompt [y/N]: " answer || die '无法读取交互输入'
-      answer="${answer:-n}"
-    fi
-    case "$answer" in
-      y | Y | yes | YES | Yes) return 0 ;;
-      n | N | no | NO | No) return 1 ;;
-      *) printf '请输入 y 或 n。\n' ;;
-    esac
-  done
+usage() {
+  cat <<'EOF'
+Linux x-ui + Shadowsocks 无交互安装
+
+不带参数：使用默认账号/密码、面板端口 18181、SS 端口 80 和 aes-256-gcm。
+用法：bash install.sh [选项]
+  --username NAME       x-ui 登录账号（默认 wochiniming）
+  --password PASS       x-ui 登录密码（默认 wochiniming）
+  --panel-port PORT     x-ui 面板端口（默认 18181）
+  --ss-port PORT        Shadowsocks 端口（默认 80）
+  --ss-method METHOD    Shadowsocks 加密方法（默认 aes-256-gcm）
+  --ss-password PASS    Shadowsocks 密码（默认随机生成）
+  --public-host IPV4    公网 IPv4（默认自动检测）
+  -h, --help            显示帮助
+
+推荐远程运行（可传参）：
+  curl -fsSL https://raw.githubusercontent.com/abxian/linux-nezha-xui-installer/main/install.sh | sudo bash -s -- --username admin --password 'CHANGE_ME' --panel-port 18181 --ss-port 80 --ss-method aes-256-gcm
+EOF
 }
 
 is_valid_port() {
   local port="$1"
-  [[ "$port" =~ ^[0-9]+$ ]] && ((10#$port >= 1 && 10#$port <= 65535))
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  (( ${#port} <= 5 )) || return 1
+  (( 10#$port >= 1 && 10#$port <= 65535 ))
 }
 
-collect_choices() {
-  local custom_port
-  printf '\nLinux x-ui + Shadowsocks 一键安装\n'
+parse_args() {
+  while (($#)); do
+    case "$1" in
+      --username|--password|--panel-port|--ss-port|--ss-method|--ss-password|--public-host)
+        (($# >= 2)) || die "缺少参数值：$1"
+        case "$1" in
+          --username) XUI_USERNAME="$2" ;;
+          --password) XUI_PASSWORD="$2" ;;
+          --panel-port) XUI_PANEL_PORT="$2" ;;
+          --ss-port) SS_PORT="$2" ;;
+          --ss-method) SS_METHOD="$2" ;;
+          --ss-password) SS_PASSWORD="$2" ;;
+          --public-host) PUBLIC_HOST="$2" ;;
+        esac
+        shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "未知参数：$1（使用 --help 查看说明）" ;;
+    esac
+  done
+}
+
+show_config() {
+  printf '\nLinux x-ui + Shadowsocks 无交互安装\n'
   printf '%s\n' '--------------------------------------------------'
-  if prompt_yes_no 'Shadowsocks 是否使用默认端口 80？' 'yes'; then
-    SS_PORT="$DEFAULT_SS_PORT"
-  else
-    while true; do
-      read -r -p '请输入 Shadowsocks 端口（1-65535，不能是 18181）: ' custom_port || die '无法读取端口'
-      if ! is_valid_port "$custom_port"; then
-        printf '端口必须是 1-65535 的整数。\n'
-      elif [[ "$custom_port" == "$XUI_PANEL_PORT" ]]; then
-        printf '端口不能与 x-ui 面板端口 %s 相同。\n' "$XUI_PANEL_PORT"
-      else
-        SS_PORT="$custom_port"
-        break
-      fi
-    done
-  fi
-  printf '选择完成：x-ui 面板端口=%s，Shadowsocks 协议=%s，端口=%s\n\n' \
-    "$XUI_PANEL_PORT" "$SS_METHOD" "$SS_PORT"
+  printf 'x-ui 账号=%s，面板端口=%s，Shadowsocks 加密=%s，端口=%s\n\n' \
+    "$XUI_USERNAME" "$XUI_PANEL_PORT" "$SS_METHOD" "$SS_PORT"
 }
 
 install_package() {
@@ -144,14 +159,21 @@ preflight_ports_and_existing_install() {
 }
 
 validate_inputs() {
-  PUBLIC_HOST="${PUBLIC_HOST:-}"
-  SS_PASSWORD="${SS_PASSWORD:-}"
+  is_valid_port "$XUI_PANEL_PORT" || die '面板端口必须是 1-65535 的整数'
+  is_valid_port "$SS_PORT" || die 'SS 端口必须是 1-65535 的整数'
+  [[ "$XUI_PANEL_PORT" != "$SS_PORT" ]] || die '面板端口与 SS 端口不能相同'
+  # x-ui installer及API需要安全传递；限制登录凭据字符，避免注入和JSON破坏。
+  [[ "$XUI_USERNAME" =~ ^[a-zA-Z0-9_.@-]{1,64}$ ]] || die '账号仅支持 1-64 位英文字母、数字、_ . @ -'
+  [[ "$XUI_PASSWORD" =~ ^[a-zA-Z0-9_.@!%+=:-]{1,128}$ ]] || die '面板密码仅支持 1-128 位字母、数字和 _.@!%+=:-'
+  case "$SS_METHOD" in
+    aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305) ;;
+    *) die 'SS 加密方法仅支持 aes-128-gcm、aes-256-gcm、chacha20-ietf-poly1305' ;;
+  esac
   if [[ -n "$PUBLIC_HOST" ]] && ! is_ipv4 "$PUBLIC_HOST"; then
-    die 'PUBLIC_HOST 必须是有效的公网 IPv4 地址'
+    die '公网地址必须是有效 IPv4'
   fi
   if [[ -n "$SS_PASSWORD" ]]; then
-    [[ "$SS_PASSWORD" != *$'\n'* && "$SS_PASSWORD" != *':'* && "$SS_PASSWORD" != *'@'* ]] || \
-      die 'SS_PASSWORD 不能包含换行、冒号或 @'
+    [[ "$SS_PASSWORD" =~ ^[a-zA-Z0-9_.@!%+=:-]{1,128}$ ]] || die 'SS 密码仅支持 1-128 位字母、数字和 _.@!%+=:-'
   else
     SS_PASSWORD=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   fi
@@ -317,9 +339,10 @@ write_connection_files() {
 }
 
 main() {
+  parse_args "$@"
   require_root_linux_systemd
-  collect_choices
   validate_inputs
+  show_config
   ensure_unzip_first
   ensure_runtime_tools
   preflight_ports_and_existing_install
