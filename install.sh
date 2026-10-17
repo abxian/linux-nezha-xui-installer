@@ -121,14 +121,22 @@ ensure_unzip_first() {
 
 ensure_runtime_tools() {
   local tool
-  for tool in curl wget tar base64 od awk grep sed tr; do
+  for tool in curl wget tar base64 od awk grep sed tr ss; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       case "$tool" in
         curl) install_package curl ;;
         wget) install_package wget ;;
         tar) install_package tar ;;
+        ss)
+          if command -v apt-get >/dev/null 2>&1; then
+            install_package iproute2
+          else
+            install_package iproute
+          fi
+          ;;
         *) die "系统缺少必需命令：$tool" ;;
       esac
+      command -v "$tool" >/dev/null 2>&1 || die "安装依赖后仍缺少命令：$tool"
     fi
   done
 }
@@ -172,7 +180,8 @@ validate_inputs() {
     die '公网地址必须是有效 IPv4'
   fi
   if [[ -n "$SS_PASSWORD" ]]; then
-    [[ "$SS_PASSWORD" =~ ^[a-zA-Z0-9_.@!%+=:-]{1,128}$ ]] || die 'SS 密码仅支持 1-128 位字母、数字和 _.@!%+=:-'
+    [[ "$SS_PASSWORD" =~ ^[a-zA-Z0-9_.!%+=-]{1,128}$ ]] || \
+      die 'SS 密码仅支持 1-128 位字母、数字和 _.!%+=-（不能包含 : 或 @）'
   else
     SS_PASSWORD=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   fi
@@ -353,5 +362,7 @@ main() {
   write_connection_files
 }
 
-# Compatible with both `bash install.sh` and `bash -c "$(curl ...)"`.
-main "$@"
+# 正常执行、bash -c 和 curl | bash 都进入 main；测试 source 时显式设置为 1。
+if [[ "${XUI_INSTALLER_SOURCE_ONLY:-0}" != '1' ]]; then
+  main "$@"
+fi
