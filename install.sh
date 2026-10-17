@@ -213,7 +213,7 @@ install_xui() {
 
 wait_for_panel() {
   local attempt
-  for attempt in $(seq 1 30); do
+  for ((attempt = 1; attempt <= 30; attempt++)); do
     if curl --fail --silent --output /dev/null "http://127.0.0.1:${XUI_PANEL_PORT}/"; then
       return 0
     fi
@@ -258,7 +258,7 @@ create_shadowsocks_inbound() {
   systemctl restart x-ui
   systemctl is-active --quiet x-ui || die '创建节点后 x-ui 重启失败'
   local attempt
-  for attempt in $(seq 1 30); do
+  for ((attempt = 1; attempt <= 30; attempt++)); do
     if port_in_use "$SS_PORT"; then return 0; fi
     sleep 1
   done
