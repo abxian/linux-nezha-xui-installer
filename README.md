@@ -50,6 +50,8 @@ curl -fsSL https://raw.githubusercontent.com/abxian/linux-nezha-xui-installer/ma
 
 脚本通过 [MHSanaei/3x-ui](https://github.com/MHSanaei/3x-ui) 官方安装器安装最新稳定版，并用当前面板 API 创建 REALITY 入站。面板本身默认使用 HTTP；固定弱口令与公开管理端口存在明显风险，至少应在云安全组限制 `18181/tcp` 只允许你的管理 IP 访问。REALITY 节点的 `443/tcp` 则需要对客户端开放。
 
+如果官方 3x-ui 已安装成功，但脚本在创建 REALITY 节点前因网络或 API 错误中断，可以重新执行同一条无参数一键命令。脚本只会在官方 `/etc/x-ui/install-result.env` 为 root 所有、组/其他用户无任何访问权限，且其中账号、密码、端口、访问路径与本次默认配置完全一致时跳过重装并安全续跑；任何不明或不同配置的已有实例仍会拒绝覆盖。
+
 验证与卸载：
 
 ```bash

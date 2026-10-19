@@ -83,11 +83,26 @@ trap cleanup_test EXIT
 # shellcheck disable=SC2034
 WORK_DIR="$mock_dir"
 
+install_result="$mock_dir/install-result.env"
+printf '%s\n' \
+  'XUI_USERNAME=wochiniming' \
+  'XUI_PASSWORD=wochiniming' \
+  'XUI_PANEL_PORT=18181' \
+  'XUI_WEB_BASE_PATH=reality' >"$install_result"
+chmod 600 "$install_result"
+install_result_values_match "$install_result"
+sed 's/XUI_PANEL_PORT=18181/XUI_PANEL_PORT=19000/' "$install_result" >"$mock_dir/wrong-result.env"
+if install_result_values_match "$mock_dir/wrong-result.env"; then
+  printf 'FAIL: mismatched prior install was accepted for resume\n' >&2
+  exit 1
+fi
+
 # Invoked indirectly by create_reality_inbound after sourcing the installer.
 # shellcheck disable=SC2317,SC2329
 curl() {
   printf '%s\n' "$*" >>"$mock_dir/curl.log"
   case "$*" in
+    *'/csrf-token'*) printf '{"success":true,"obj":"abcdefghijklmnopqrstuvwxyz0123456789_-ABCDE"}' ;;
     *'/login'*) printf '{"success":true}' ;;
     *'/panel/api/inbounds/list'*) printf '{"success":true,"obj":[]}' ;;
     *'/panel/api/server/getNewX25519Cert'*)
@@ -106,6 +121,11 @@ systemctl() { return 0; }
 port_in_use() { return 0; }
 
 create_reality_inbound
+grep -q '/reality/csrf-token' "$mock_dir/curl.log"
+if [[ $(grep -c 'X-CSRF-Token: abcdefghijklmnopqrstuvwxyz0123456789_-ABCDE' "$mock_dir/curl.log") -lt 2 ]]; then
+  printf 'FAIL: login and inbound POST did not both carry the CSRF token\n' >&2
+  exit 1
+fi
 grep -q '/reality/panel/api/inbounds/add' "$mock_dir/curl.log"
 grep -q '"port":443' "$mock_dir/curl.log"
 grep -q '"protocol":"vless"' "$mock_dir/curl.log"

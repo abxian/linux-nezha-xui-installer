@@ -10,6 +10,7 @@ readonly DEFAULT_REALITY_PORT='443'
 DEFAULT_REALITY_SNI='www.cloudflare.com'
 readonly REALITY_REMARK='independent-ip-reality'
 readonly XUI_INSTALL_URL='https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh'
+readonly XUI_INSTALL_RESULT_FILE='/etc/x-ui/install-result.env'
 
 WORK_DIR=''
 XUI_USERNAME="$DEFAULT_XUI_USERNAME"
@@ -23,6 +24,7 @@ CLIENT_UUID=''
 REALITY_PRIVATE_KEY=''
 REALITY_PUBLIC_KEY=''
 REALITY_SHORT_ID=''
+RESUME_EXISTING=0
 
 log() { printf '[3x-ui installer] %s\n' "$*"; }
 warn() { printf '[3x-ui installer] WARNING: %s\n' "$*" >&2; }
@@ -156,14 +158,49 @@ port_in_use() {
 }
 
 preflight() {
-  if [[ -x /usr/local/x-ui/x-ui ]] || [[ -e /etc/x-ui/x-ui.db ]] || \
-     [[ -e /etc/systemd/system/x-ui.service ]] || command -v x-ui >/dev/null 2>&1; then
-    die '检测到已有 x-ui/3x-ui。两者共用安装路径；为避免覆盖现有节点，本脚本拒绝继续。'
+  if existing_xui_install_detected; then
+    if install_result_is_safe && install_result_values_match "$XUI_INSTALL_RESULT_FILE"; then
+      RESUME_EXISTING=1
+      log '检测到本脚本上次未完成的同配置 3x-ui 安装，将跳过重装并继续创建 REALITY 节点'
+    else
+      die '检测到已有 x-ui/3x-ui，但无法确认是完全相同配置的中断安装；为避免覆盖现有节点，本脚本拒绝继续。'
+    fi
+  elif port_in_use "$XUI_PANEL_PORT"; then
+    die "本机端口 $XUI_PANEL_PORT 已被占用，不能作为 3x-ui 面板端口"
   fi
-  port_in_use "$XUI_PANEL_PORT" && die "本机端口 $XUI_PANEL_PORT 已被占用，不能作为 3x-ui 面板端口"
   port_in_use "$REALITY_PORT" && die "本机端口 $REALITY_PORT 已被占用，不能创建 REALITY 节点"
   return 0
 }
+
+existing_xui_install_detected() {
+  [[ -x /usr/local/x-ui/x-ui ]] || [[ -e /etc/x-ui/x-ui.db ]] || \
+    [[ -e /etc/systemd/system/x-ui.service ]] || command -v x-ui >/dev/null 2>&1
+}
+
+install_result_is_safe() {
+  local owner mode
+  [[ -f "$XUI_INSTALL_RESULT_FILE" ]] || return 1
+  owner=$(stat -c '%u' "$XUI_INSTALL_RESULT_FILE" 2>/dev/null) || return 1
+  mode=$(stat -c '%a' "$XUI_INSTALL_RESULT_FILE" 2>/dev/null) || return 1
+  [[ "$owner" == '0' && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#$mode & 8#077) == 0 ))
+}
+
+install_result_values_match() (
+  local file="$1"
+  local expected_username="$XUI_USERNAME"
+  local expected_password="$XUI_PASSWORD"
+  local expected_port="$XUI_PANEL_PORT"
+  local expected_path="$XUI_WEB_PATH"
+  [[ -r "$file" ]] || return 1
+  # This root-owned 0600 file is written by the official 3x-ui installer.
+  # shellcheck disable=SC1090
+  source "$file"
+  [[ "${XUI_USERNAME:-}" == "$expected_username" ]] &&
+    [[ "${XUI_PASSWORD:-}" == "$expected_password" ]] &&
+    [[ "${XUI_PANEL_PORT:-}" == "$expected_port" ]] &&
+    [[ "${XUI_WEB_BASE_PATH:-}" == "$expected_path" ]]
+)
 
 download_file() {
   local url="$1" destination="$2"
@@ -228,14 +265,23 @@ generate_client_values() {
 }
 
 create_reality_inbound() {
-  local base cookies login_response list_response key_response add_response payload target
+  local base cookies csrf_response csrf_token login_response list_response
+  local key_response add_response payload target
   base=$(panel_base_url)
   cookies="$WORK_DIR/3x-ui.cookies"
   target="${REALITY_SNI}:443"
   log "登录本机 3x-ui 并创建 VLESS + REALITY :$REALITY_PORT 入站"
+  csrf_response=$(curl --fail --show-error --silent \
+    --cookie-jar "$cookies" \
+    "$base/csrf-token")
+  json_success "$csrf_response" || die '3x-ui CSRF 令牌获取失败'
+  csrf_token=$(json_string_field "$csrf_response" 'obj')
+  [[ "$csrf_token" =~ ^[A-Za-z0-9_-]{32,128}$ ]] || die '3x-ui 返回的 CSRF 令牌格式无效'
   login_response=$(curl --fail --show-error --silent \
+    --cookie "$cookies" \
     --cookie-jar "$cookies" \
     --header 'Content-Type: application/json' \
+    --header "X-CSRF-Token: $csrf_token" \
     --data "{\"username\":\"${XUI_USERNAME}\",\"password\":\"${XUI_PASSWORD}\"}" \
     "$base/login")
   json_success "$login_response" || die '3x-ui 本机登录失败'
@@ -260,6 +306,7 @@ create_reality_inbound() {
     "$target" "$REALITY_SNI" "$REALITY_PRIVATE_KEY" "$REALITY_SHORT_ID" "$REALITY_PUBLIC_KEY")
   add_response=$(curl --fail --show-error --silent --cookie "$cookies" \
     --header 'Content-Type: application/json' \
+    --header "X-CSRF-Token: $csrf_token" \
     --data "$payload" \
     "$base/panel/api/inbounds/add")
   json_success "$add_response" || die "3x-ui 创建 REALITY 入站失败：$add_response"
@@ -364,7 +411,9 @@ main() {
   preflight
   WORK_DIR=$(mktemp -d /tmp/linux-3xui-reality.XXXXXX)
   generate_client_values
-  install_3xui
+  if [[ "$RESUME_EXISTING" != '1' ]]; then
+    install_3xui
+  fi
   wait_for_panel
   create_reality_inbound
   open_firewall_ports
