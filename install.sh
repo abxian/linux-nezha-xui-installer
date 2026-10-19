@@ -1,368 +1,111 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-
-readonly XUI_VERSION='0.3.2'
-DEFAULT_XUI_USERNAME='wochiniming'
-DEFAULT_XUI_PASSWORD='wochiniming'
-DEFAULT_XUI_PANEL_PORT='18181'
-readonly DEFAULT_SS_PORT='80'
-DEFAULT_SS_METHOD='aes-256-gcm'
-readonly SS_REMARK='independent-ip'
-readonly XUI_INSTALL_URL='https://raw.githubusercontent.com/vaxilu/x-ui/master/install.sh'
-
-WORK_DIR=''
-XUI_USERNAME="$DEFAULT_XUI_USERNAME"
-XUI_PASSWORD="$DEFAULT_XUI_PASSWORD"
-XUI_PANEL_PORT="$DEFAULT_XUI_PANEL_PORT"
-SS_PORT="$DEFAULT_SS_PORT"
-SS_METHOD="$DEFAULT_SS_METHOD"
-PUBLIC_HOST="${PUBLIC_HOST:-}"
-SS_PASSWORD="${SS_PASSWORD:-}"
-
-log() { printf '[installer] %s\n' "$*"; }
-warn() { printf '[installer] WARNING: %s\n' "$*" >&2; }
-die() { printf '[installer] ERROR: %s\n' "$*" >&2; exit 1; }
-cleanup() {
-  if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
-    rm -rf -- "${WORK_DIR}"
-  fi
-}
-trap cleanup EXIT
-
-require_root_linux_systemd() {
-  [[ "$(id -u)" -eq 0 ]] || die '请切换到 root 后重新执行一键命令'
-  [[ "$(uname -s)" == 'Linux' ]] || die '仅支持 Linux'
-  command -v systemctl >/dev/null 2>&1 || die '系统没有 systemd/systemctl，无法安装 x-ui 服务'
-  case "$(uname -m)" in
-    x86_64 | amd64 | aarch64 | arm64 | armv7l | armv7) ;;
-    *) die "vaxilu/x-ui 0.3.2 不支持当前架构：$(uname -m)" ;;
+# vaxilu/x-ui 0.3.2: one SS inbound, many client IP endpoints, origin egress.
+UPSTREAM='https://raw.githubusercontent.com/abxian/linux-nezha-xui-installer/main/install.sh'
+PANEL_USER="${XUI_USERNAME:-wochiniming}"
+PANEL_PASS="${XUI_PASSWORD:-wochiniming}"
+PANEL_PORT="${XUI_PANEL_PORT:-18181}"
+SS_PORT="${SS_PORT:-80}"
+SS_METHOD="${SS_METHOD:-aes-256-gcm}"
+SS_PASSWORD="${SS_PASSWORD:-wochiniming}"
+for ((i=1;i<=$#;i++)); do :; done
+while (($#)); do
+  case "$1" in
+    --username) PANEL_USER="$2"; shift 2;;
+    --password) PANEL_PASS="$2"; shift 2;;
+    --panel-port) PANEL_PORT="$2"; shift 2;;
+    --ss-port) SS_PORT="$2"; shift 2;;
+    --ss-method) SS_METHOD="$2"; shift 2;;
+    --ss-password) SS_PASSWORD="$2"; shift 2;;
+    *) echo "未知选项: $1" >&2; exit 1;;
   esac
-}
-
-usage() {
-  cat <<'EOF'
-Linux x-ui + Shadowsocks 无交互安装
-
-不带参数：使用默认账号/密码、面板端口 18181、SS 端口 80 和 aes-256-gcm。
-用法：bash install.sh [选项]
-  --username NAME       x-ui 登录账号（默认 wochiniming）
-  --password PASS       x-ui 登录密码（默认 wochiniming）
-  --panel-port PORT     x-ui 面板端口（默认 18181）
-  --ss-port PORT        Shadowsocks 端口（默认 80）
-  --ss-method METHOD    Shadowsocks 加密方法（默认 aes-256-gcm）
-  --ss-password PASS    Shadowsocks 密码（默认随机生成）
-  --public-host IPV4    公网 IPv4（默认自动检测）
-  -h, --help            显示帮助
-
-推荐远程运行（可传参）：
-  curl -fsSL https://raw.githubusercontent.com/abxian/linux-nezha-xui-installer/main/install.sh | sudo bash -s -- --username admin --password 'CHANGE_ME' --panel-port 18181 --ss-port 80 --ss-method aes-256-gcm
-EOF
-}
-
-is_valid_port() {
-  local port="$1"
-  [[ "$port" =~ ^[0-9]+$ ]] || return 1
-  (( ${#port} <= 5 )) || return 1
-  (( 10#$port >= 1 && 10#$port <= 65535 ))
-}
-
-parse_args() {
-  while (($#)); do
-    case "$1" in
-      --username|--password|--panel-port|--ss-port|--ss-method|--ss-password|--public-host)
-        (($# >= 2)) || die "缺少参数值：$1"
-        case "$1" in
-          --username) XUI_USERNAME="$2" ;;
-          --password) XUI_PASSWORD="$2" ;;
-          --panel-port) XUI_PANEL_PORT="$2" ;;
-          --ss-port) SS_PORT="$2" ;;
-          --ss-method) SS_METHOD="$2" ;;
-          --ss-password) SS_PASSWORD="$2" ;;
-          --public-host) PUBLIC_HOST="$2" ;;
-        esac
-        shift 2 ;;
-      -h|--help) usage; exit 0 ;;
-      *) die "未知参数：$1（使用 --help 查看说明）" ;;
-    esac
-  done
-}
-
-show_config() {
-  printf '\nLinux x-ui + Shadowsocks 无交互安装\n'
-  printf '%s\n' '--------------------------------------------------'
-  printf 'x-ui 账号=%s，面板端口=%s，Shadowsocks 加密=%s，端口=%s\n\n' \
-    "$XUI_USERNAME" "$XUI_PANEL_PORT" "$SS_METHOD" "$SS_PORT"
-}
-
-install_package() {
-  local package="$1"
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y "$package"
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y "$package"
-  else
-    die "未识别包管理器，无法安装 $package；支持 apt-get、dnf、yum"
-  fi
-}
-
-ensure_unzip_first() {
-  if command -v unzip >/dev/null 2>&1; then
-    log "unzip 已安装：$(command -v unzip)"
-  else
-    log '未检测到 unzip，开始安装'
-    install_package unzip
-    command -v unzip >/dev/null 2>&1 || die 'unzip 安装失败'
-  fi
-}
-
-ensure_runtime_tools() {
-  local tool
-  for tool in curl wget tar base64 od awk grep sed tr ss; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-      case "$tool" in
-        curl) install_package curl ;;
-        wget) install_package wget ;;
-        tar) install_package tar ;;
-        ss)
-          if command -v apt-get >/dev/null 2>&1; then
-            install_package iproute2
-          else
-            install_package iproute
-          fi
-          ;;
-        *) die "系统缺少必需命令：$tool" ;;
-      esac
-      command -v "$tool" >/dev/null 2>&1 || die "安装依赖后仍缺少命令：$tool"
-    fi
-  done
-}
-
-port_in_use() {
-  local port="$1"
-  # Only treat listening TCP sockets and bound UDP sockets as occupied.
-  # The former /proc-based check could incorrectly flag non-listening sockets.
-  command -v ss >/dev/null 2>&1 || die '缺少 ss 命令（通常由 iproute2 软件包提供）'
-  ss -H -lntu | awk -v port="$port" '
-    $5 ~ (":" port "$") { found=1; exit }
-    END { exit !found }
-  '
-}
-
-preflight_ports_and_existing_install() {
-  if [[ -x /usr/local/x-ui/x-ui ]]; then
-    die '检测到已有 x-ui。为避免覆盖现有节点，本脚本不会重装；请先备份并卸载旧实例后再运行。'
-  fi
-  if port_in_use "$XUI_PANEL_PORT"; then
-    die "本机端口 $XUI_PANEL_PORT 已被占用，不能作为 x-ui 面板端口"
-  fi
-  if port_in_use "$SS_PORT"; then
-    die "本机端口 $SS_PORT 已被占用，不能创建 Shadowsocks 节点"
-  fi
-  return 0
-}
-
-validate_inputs() {
-  is_valid_port "$XUI_PANEL_PORT" || die '面板端口必须是 1-65535 的整数'
-  is_valid_port "$SS_PORT" || die 'SS 端口必须是 1-65535 的整数'
-  [[ "$XUI_PANEL_PORT" != "$SS_PORT" ]] || die '面板端口与 SS 端口不能相同'
-  # x-ui installer及API需要安全传递；限制登录凭据字符，避免注入和JSON破坏。
-  [[ "$XUI_USERNAME" =~ ^[a-zA-Z0-9_.@-]{1,64}$ ]] || die '账号仅支持 1-64 位英文字母、数字、_ . @ -'
-  [[ "$XUI_PASSWORD" =~ ^[a-zA-Z0-9_.@!%+=:-]{1,128}$ ]] || die '面板密码仅支持 1-128 位字母、数字和 _.@!%+=:-'
-  case "$SS_METHOD" in
-    aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305) ;;
-    *) die 'SS 加密方法仅支持 aes-128-gcm、aes-256-gcm、chacha20-ietf-poly1305' ;;
-  esac
-  if [[ -n "$PUBLIC_HOST" ]] && ! is_ipv4 "$PUBLIC_HOST"; then
-    die '公网地址必须是有效 IPv4'
-  fi
-  if [[ -n "$SS_PASSWORD" ]]; then
-    [[ "$SS_PASSWORD" =~ ^[a-zA-Z0-9_.!%+=-]{1,128}$ ]] || \
-      die 'SS 密码仅支持 1-128 位字母、数字和 _.!%+=-（不能包含 : 或 @）'
-  else
-    SS_PASSWORD=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-  fi
-}
-
-download_file() {
-  local url="$1" destination="$2"
-  curl --fail --show-error --silent --location \
-    --retry 3 --retry-delay 2 --connect-timeout 20 \
-    "$url" -o "$destination"
-  [[ -s "$destination" ]] || die "下载结果为空：$url"
-}
-
-install_xui() {
-  local script="$WORK_DIR/x-ui-install.sh"
-  log "安装 vaxilu/x-ui $XUI_VERSION"
-  download_file "$XUI_INSTALL_URL" "$script"
-  chmod 700 "$script"
-  printf 'y\n%s\n%s\n%s\n' "$XUI_USERNAME" "$XUI_PASSWORD" "$XUI_PANEL_PORT" | \
-    bash "$script" "$XUI_VERSION"
-  [[ -x /usr/local/x-ui/x-ui ]] || die 'x-ui 安装完成后未找到主程序'
-  /usr/local/x-ui/x-ui setting -username "$XUI_USERNAME" -password "$XUI_PASSWORD"
-  /usr/local/x-ui/x-ui setting -port "$XUI_PANEL_PORT"
-  systemctl daemon-reload
-  systemctl enable x-ui
-  systemctl restart x-ui
-  systemctl is-active --quiet x-ui || die 'x-ui 服务启动失败'
-}
-
-wait_for_panel() {
-  local attempt
-  for ((attempt = 1; attempt <= 30; attempt++)); do
-    if curl --fail --silent --output /dev/null "http://127.0.0.1:${XUI_PANEL_PORT}/"; then
-      return 0
-    fi
-    sleep 1
-  done
-  die "x-ui 面板在 30 秒内没有监听 127.0.0.1:$XUI_PANEL_PORT"
-}
-
-create_shadowsocks_inbound() {
-  local cookies="$WORK_DIR/x-ui.cookies"
-  local login_response list_response add_response settings stream_settings sniffing
-  log "登录本机 x-ui 并创建 Shadowsocks :$SS_PORT 节点"
-  login_response=$(curl --fail --show-error --silent \
-    --cookie-jar "$cookies" \
-    --header 'Content-Type: application/json' \
-    --data "{\"username\":\"${XUI_USERNAME}\",\"password\":\"${XUI_PASSWORD}\"}" \
-    "http://127.0.0.1:${XUI_PANEL_PORT}/login")
-  grep -Eq '"success"[[:space:]]*:[[:space:]]*true' <<<"$login_response" || die 'x-ui 本机登录失败'
-  list_response=$(curl --fail --show-error --silent --cookie "$cookies" \
-    --request POST "http://127.0.0.1:${XUI_PANEL_PORT}/xui/inbound/list")
-  if grep -Eq "\"port\"[[:space:]]*:[[:space:]]*${SS_PORT}([,}])" <<<"$list_response"; then
-    die "x-ui 中已经存在端口 $SS_PORT 的入站，拒绝覆盖"
-  fi
-  settings=$(printf '{"method":"%s","password":"%s","network":"tcp,udp"}' "$SS_METHOD" "$SS_PASSWORD")
-  stream_settings='{"network":"tcp","security":"none","tcpSettings":{"acceptProxyProtocol":false,"header":{"type":"none"}}}'
-  sniffing='{"enabled":true,"destOverride":["http","tls"]}'
-  add_response=$(curl --fail --show-error --silent --cookie "$cookies" \
-    --request POST "http://127.0.0.1:${XUI_PANEL_PORT}/xui/inbound/add" \
-    --data-urlencode 'up=0' \
-    --data-urlencode 'down=0' \
-    --data-urlencode 'total=0' \
-    --data-urlencode "remark=$SS_REMARK" \
-    --data-urlencode 'enable=true' \
-    --data-urlencode 'expiryTime=0' \
-    --data-urlencode 'listen=' \
-    --data-urlencode "port=$SS_PORT" \
-    --data-urlencode 'protocol=shadowsocks' \
-    --data-urlencode "settings=$settings" \
-    --data-urlencode "streamSettings=$stream_settings" \
-    --data-urlencode "sniffing=$sniffing")
-  grep -Eq '"success"[[:space:]]*:[[:space:]]*true' <<<"$add_response" || die 'x-ui 创建 Shadowsocks 入站失败'
-  systemctl restart x-ui
-  systemctl is-active --quiet x-ui || die '创建节点后 x-ui 重启失败'
-  local attempt
-  for ((attempt = 1; attempt <= 30; attempt++)); do
-    if port_in_use "$SS_PORT"; then return 0; fi
-    sleep 1
-  done
-  die "Shadowsocks 入站在 30 秒内没有监听端口 $SS_PORT"
-}
-
-open_firewall_ports() {
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    ufw allow "${XUI_PANEL_PORT}/tcp"
-    ufw allow "${SS_PORT}/tcp"
-    ufw allow "${SS_PORT}/udp"
-    log '已更新 UFW 规则'
-  elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-    firewall-cmd --permanent --add-port="${XUI_PANEL_PORT}/tcp"
-    firewall-cmd --permanent --add-port="${SS_PORT}/tcp"
-    firewall-cmd --permanent --add-port="${SS_PORT}/udp"
-    firewall-cmd --reload
-    log '已更新 firewalld 规则'
-  else
-    warn "未检测到启用中的 UFW/firewalld；请在云安全组和主机防火墙放行 ${XUI_PANEL_PORT}/tcp、${SS_PORT}/tcp、${SS_PORT}/udp"
-  fi
-}
-
-is_ipv4() {
-  local value="$1" octet
-  local -a octets
-  [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  IFS='.' read -r -a octets <<<"$value"
-  for octet in "${octets[@]}"; do
-    ((10#$octet >= 0 && 10#$octet <= 255)) || return 1
-  done
-  return 0
-}
-
-detect_public_host() {
-  local endpoint candidate
-  if [[ -n "$PUBLIC_HOST" ]]; then
-    printf '%s' "$PUBLIC_HOST"
-    return 0
-  fi
-  for endpoint in 'https://api.ipify.org' 'https://ipv4.icanhazip.com' 'https://ifconfig.me/ip'; do
-    candidate=$(curl -4 --fail --show-error --silent --location --connect-timeout 10 "$endpoint" 2>/dev/null | tr -d '[:space:]') || true
-    if is_ipv4 "$candidate"; then
-      printf '%s' "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-
-build_ss_uri() {
-  local host="$1" password="$2" remark="${3:-$SS_REMARK}" encoded
-  encoded=$(printf '%s:%s@%s:%s' "$SS_METHOD" "$password" "$host" "$SS_PORT" | \
-    base64 | tr -d '\n=' | tr '+/' '-_')
-  printf 'ss://%s#%s' "$encoded" "$remark"
-}
-
-write_connection_files() {
-  local public_host ss_uri
-  local summary='/root/independent-ip-node.txt'
-  local clash_yaml='/root/independent-ip-clash.yaml'
-  public_host=$(detect_public_host) || die '无法检测公网 IPv4；重新运行时设置 PUBLIC_HOST=你的公网IP'
-  ss_uri=$(build_ss_uri "$public_host" "$SS_PASSWORD")
-  {
-    printf 'x-ui panel: http://%s:%s\n' "$public_host" "$XUI_PANEL_PORT"
-    printf 'x-ui username: %s\n' "$XUI_USERNAME"
-    printf 'x-ui password: %s\n' "$XUI_PASSWORD"
-    printf 'Shadowsocks URI: %s\n' "$ss_uri"
-  } >"$summary"
-  {
-    printf -- '- name: independent-ip\n'
-    printf '  type: ss\n'
-    printf '  server: %s\n' "$public_host"
-    printf '  port: %s\n' "$SS_PORT"
-    printf '  cipher: %s\n' "$SS_METHOD"
-    printf '  password: "%s"\n' "$SS_PASSWORD"
-    printf '  udp: true\n'
-  } >"$clash_yaml"
-  chmod 600 "$summary" "$clash_yaml"
-  printf '\n安装完成。\n'
-  printf 'x-ui 面板: http://%s:%s\n' "$public_host" "$XUI_PANEL_PORT"
-  printf 'x-ui 账号/密码: %s / %s\n' "$XUI_USERNAME" "$XUI_PASSWORD"
-  printf '路由器可导入 SS 链接:\n%s\n' "$ss_uri"
-  printf 'Clash/OpenClash 节点 YAML: %s\n' "$clash_yaml"
-  printf '完整结果: %s\n' "$summary"
-}
-
-main() {
-  parse_args "$@"
-  require_root_linux_systemd
-  validate_inputs
-  show_config
-  ensure_unzip_first
-  ensure_runtime_tools
-  preflight_ports_and_existing_install
-  WORK_DIR=$(mktemp -d /tmp/linux-xui-ss.XXXXXX)
-  install_xui
-  wait_for_panel
-  create_shadowsocks_inbound
-  open_firewall_ports
-  write_connection_files
-}
-
-# 正常执行、bash -c 和 curl | bash 都进入 main；测试 source 时显式设置为 1。
-if [[ "${XUI_INSTALLER_SOURCE_ONLY:-0}" != '1' ]]; then
-  main "$@"
+done
+[[ $EUID -eq 0 ]] || { echo '请使用 sudo bash 运行' >&2; exit 1; }
+for c in python3 curl ip systemctl awk; do command -v "$c" >/dev/null || { echo "缺少命令: $c" >&2; exit 1; }; done
+[[ "$PANEL_PORT" =~ ^[0-9]+$ && "$SS_PORT" =~ ^[0-9]+$ ]] || { echo '端口必须为数字' >&2; exit 1; }
+(( PANEL_PORT>=1 && PANEL_PORT<=65535 && SS_PORT>=1 && SS_PORT<=65535 && PANEL_PORT!=SS_PORT )) || { echo '端口范围或冲突错误' >&2; exit 1; }
+case "$SS_METHOD" in aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305) ;; *) echo '不支持加密方式' >&2; exit 1;; esac
+export PANEL_USER PANEL_PASS PANEL_PORT SS_PORT SS_METHOD SS_PASSWORD
+mapfile -t IPS < <(ip -o -4 addr show scope global | awk '{split($4,a,"/");print a[1]}' | sort -u | python3 -c 'import sys,ipaddress;print("\n".join(ip for x in sys.stdin if (ip:=x.strip()) and ipaddress.ip_address(ip).is_global))')
+((${#IPS[@]})) || { echo '没有检测到绑定在网卡上的公网 IPv4。执行 ip -4 addr 排查。' >&2; exit 1; }
+printf '本地网卡公网 IP (%d): %s\n' "${#IPS[@]}" "${IPS[*]}"
+for addr in "${IPS[@]}"; do
+  actual=$(curl -4fsS --interface "$addr" --connect-timeout 4 --max-time 10 https://api.ipify.org 2>/dev/null || true)
+  if [[ "$actual" == "$addr" ]]; then echo "源地址出站测试通过: $addr";
+  else echo "警告: $addr 不能从该 IP 出站（查询结果: ${actual:-失败}），对应节点可能无法联网。" >&2; fi
+done
+DB='/etc/x-ui/x-ui.db'
+if [[ ! -x /usr/local/x-ui/x-ui ]]; then
+  echo '未安装 x-ui：运行原仓库安装程序，显式传递统一 SS 密码。'
+  temp=$(mktemp -d); trap 'rm -rf "$temp"' EXIT
+  curl -fsSL --retry 3 "$UPSTREAM" -o "$temp/upstream.sh"
+  SS_PASSWORD="$SS_PASSWORD" bash "$temp/upstream.sh" --username "$PANEL_USER" --password "$PANEL_PASS" --panel-port "$PANEL_PORT" --ss-port "$SS_PORT" --ss-method "$SS_METHOD" --ss-password "$SS_PASSWORD" --public-host "${IPS[0]}"
+else
+  echo '检测到现有 x-ui：保留安装，修改目标 SS 入站和 Xray 模板。'
 fi
+[[ -f "$DB" ]] || { echo "找不到 x-ui 数据库: $DB" >&2; exit 1; }
+mkdir -p /root/x-ui-backups
+BACKUP="/root/x-ui-backups/x-ui-$(date +%Y%m%d-%H%M%S).db"
+python3 - "$DB" "$BACKUP" <<'PY'
+import sqlite3,sys
+src=sqlite3.connect(sys.argv[1]); dst=sqlite3.connect(sys.argv[2]);src.backup(dst);dst.close();src.close()
+PY
+echo "已备份数据库: $BACKUP"
+python3 - "$DB" <<'PY'
+import os,json,sqlite3,sys
+port=int(os.environ['SS_PORT']); password=os.environ['SS_PASSWORD']; method=os.environ['SS_METHOD']
+db=sqlite3.connect(sys.argv[1]);db.execute('BEGIN IMMEDIATE')
+try:
+    rows=db.execute('SELECT id,port,protocol,settings FROM inbounds WHERE port=?',(port,)).fetchall()
+    if len(rows)!=1 or rows[0][2]!='shadowsocks':
+        raise RuntimeError(f'未找到唯一的 Shadowsocks :{port} 入站（找到 {len(rows)} 条）；为避免修改错误节点，请检查面板')
+    inbound_id,_,_,settings=rows[0]
+    cfg=json.loads(settings); cfg['method']=method;cfg['password']=password;cfg['network']='tcp,udp'
+    db.execute('UPDATE inbounds SET settings=?, listen=? WHERE id=?',(json.dumps(cfg,ensure_ascii=False,separators=(',',':')),'',inbound_id))
+    r=db.execute("SELECT value FROM settings WHERE key='xrayTemplateConfig'").fetchone()
+    if r is None: raise RuntimeError('x-ui 缺少 xrayTemplateConfig，未修改；检查版本')
+    template=json.loads(r[0]);outbounds=template.get('outbounds',[])
+    if not outbounds: raise RuntimeError('Xray 模板没有默认出站')
+    # The default (first) outbound is the fallback; the one-port SS inbound uses it.
+    first=outbounds[0]
+    if first.get('protocol')!='freedom': raise RuntimeError('模板第一个出站不是 freedom，拒绝自动更改')
+    first['sendThrough']='origin'
+    first.setdefault('settings',{})
+    # Do not overwrite existing routing, API, or blocking settings.
+    db.execute("UPDATE settings SET value=? WHERE key='xrayTemplateConfig'",(json.dumps(template,ensure_ascii=False,separators=(',',':')),))
+    db.commit()
+except Exception:
+    db.rollback();raise
+finally:
+    db.close()
+print(f'已配置 SS 入站端口 {port}，密码固定；默认 freedom 出站 sendThrough=origin')
+PY
+systemctl restart x-ui
+systemctl is-active --quiet x-ui || { echo "x-ui 服务没有启动。备份: $BACKUP" >&2; exit 1; }
+# Generate URIs and Clash profiles (the same credentials, different server IPs).
+printf '%s\n' "${IPS[@]}" | python3 -c '
+import os,sys,json,base64,ipaddress
+ips=[x.strip() for x in sys.stdin if x.strip()]
+p=os.environ["SS_PASSWORD"]; port=int(os.environ["SS_PORT"]);method=os.environ["SS_METHOD"]
+uri=[];node=[]
+for idx,ip in enumerate(ips,1):
+    name=f"美国{idx:02d}"
+    token=base64.urlsafe_b64encode(f"{method}:{p}".encode()).decode().rstrip("=")
+    uri.append(f"{name}: ss://{token}@{ip}:{port}#{name}")
+    node.append(dict(name=name,type="ss",server=ip,port=port,cipher=method,password=p,udp=True))
+open("/root/multiip-ss-links.txt","w").write("\n".join(uri)+"\n")
+# Valid Clash YAML with quoted password and names.
+with open("/root/multiip-ss-clash.yaml","w") as f:
+    f.write("proxies:\n")
+    for n in node:
+        f.write("  - name: "+json.dumps(n["name"],ensure_ascii=False)+"\n")
+        for key in ("type","server","port","cipher","password","udp"):
+            f.write(f"    {key}: {json.dumps(n[key],ensure_ascii=False)}\n")
+print("\n".join(uri))
+'
+chmod 600 /root/multiip-ss-links.txt /root/multiip-ss-clash.yaml
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then ufw allow "$SS_PORT/tcp"; ufw allow "$SS_PORT/udp"; fi
+printf '\n完成。SS 密码: %s；共 %s 个公网 IP，共用端口 %s\n' "$SS_PASSWORD" "${#IPS[@]}" "$SS_PORT"
+printf 'SS 链接: /root/multiip-ss-links.txt\nClash YAML: /root/multiip-ss-clash.yaml\n'
+echo '注意: origin 依赖 Xray 版本及宿主机路由；请逐个测试出口，UDP 不保证沿用相同源地址。'
