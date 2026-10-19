@@ -60,7 +60,25 @@ rollback() {
     echo "[ERROR] 诊断日志: $LOG" >&2
     cat "$LOG" >&2 || :
   elif (( code != 0 )); then
-    echo "[ERROR] 安装尚未修改旧安装，退出码: $code" >&2
+    {
+      echo '=== 安装预检查失败（未修改旧安装） ==='
+      date -Is
+      echo "退出码: $code"
+      echo "旧安装未被卸载或修改"
+      if [[ -f "$WORK/xui-entries.txt" ]]; then
+        echo '--- x-ui 压缩包条目前 30 行 ---'
+        head -n 30 "$WORK/xui-entries.txt"
+      fi
+      if [[ -f "$WORK/release.json" ]]; then
+        echo '--- Xray 版本 ---'
+        python3 - "$WORK/release.json" <<'PY_JSON' || :
+import json,sys
+try: print(json.load(open(sys.argv[1])).get('tag_name','unknown'))
+except Exception: print('invalid release JSON')
+PY_JSON
+      fi
+    } > "$LOG"
+    echo "[ERROR] 安装尚未修改旧安装，退出码: $code；新诊断日志: $LOG" >&2
   fi
   rm -rf "$WORK"
   exit "$code"
@@ -81,8 +99,23 @@ done
 
 echo '[2/7] 下载并验证安装包（此阶段不会卸载旧版）'
 curl -fL --retry 3 -o "$WORK/xui.tar.gz" "https://github.com/vaxilu/x-ui/releases/download/${XUI_VERSION}/x-ui-linux-${XUI_ARCH}.tar.gz"
-tar -tzf "$WORK/xui.tar.gz" | grep -qx 'x-ui/x-ui' || { echo 'x-ui 压缩包内容异常' >&2; exit 1; }
-tar -xzf "$WORK/xui.tar.gz" -C "$WORK"
+# Validate that the archive is readable, extract it, then check files on disk.
+# Tar entries may be prefixed with ./; exact matching against tar -t output
+# incorrectly rejects valid archives.
+if ! tar -tzf "$WORK/xui.tar.gz" > "$WORK/xui-entries.txt"; then
+  echo '[ERROR] x-ui 压缩包不能正常读取' >&2
+  exit 1
+fi
+if ! tar -xzf "$WORK/xui.tar.gz" -C "$WORK"; then
+  echo '[ERROR] x-ui 压缩包解压失败' >&2
+  exit 1
+fi
+if [[ ! -f "$WORK/x-ui/x-ui" || ! -f "$WORK/x-ui/x-ui.service" || ! -d "$WORK/x-ui/bin" ]]; then
+  echo '[ERROR] 解压后找不到 x-ui 核心文件。压缩包前 30 个条目:' >&2
+  head -n 30 "$WORK/xui-entries.txt" >&2
+  exit 1
+fi
+
 # Use github API to find current stable Xray release (latest non-prerelease).
 curl -fLsS --retry 3 https://api.github.com/repos/XTLS/Xray-core/releases/latest -o "$WORK/release.json"
 XRAY_VERSION="$(python3 - "$WORK/release.json" <<'PY'
