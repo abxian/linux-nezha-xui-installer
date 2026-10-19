@@ -1,294 +1,207 @@
 #!/usr/bin/env bash
+# Fresh legacy x-ui 0.3.2 + recent Xray; multi-IP one-port Shadowsocks.
 set -Eeuo pipefail
 umask 077
-# x-ui 0.3.2: one SS inbound, one port, different server IP endpoints.
-XUI_USERNAME="${XUI_USERNAME:-wochiniming}"
-XUI_PASSWORD="${XUI_PASSWORD:-wochiniming}"
-XUI_PANEL_PORT="${XUI_PANEL_PORT:-18181}"
+export DEBIAN_FRONTEND=noninteractive
+PANEL_USER="${XUI_USERNAME:-wochiniming}"
+PANEL_PASS="${XUI_PASSWORD:-wochiniming}"
+PANEL_PORT="${XUI_PANEL_PORT:-18181}"
+SS_PASS="${SS_PASSWORD:-wochiniming}"
 SS_PORT="${SS_PORT:-80}"
-SS_METHOD="${SS_METHOD:-aes-256-gcm}"
-SS_PASSWORD="${SS_PASSWORD:-wochiniming}"
+SS_METHOD="aes-256-gcm"
+XUI_VERSION="0.3.2"
 DB=/etc/x-ui/x-ui.db
-REPORT=/root/x-ui-multiip-diagnostic.log
-DIAGDIR=/root/x-ui-multiip-debug
-BACKUP=''
-WORKDIR=''
-log(){ printf '[installer] %s\n' "$*"; }
-fail(){ printf '[ERROR] %s\n' "$*" >&2; exit 1; }
-cleanup(){ [[ -z "$WORKDIR" ]] || rm -rf "$WORKDIR"; }
-trap cleanup EXIT
-usage(){ cat <<'EOF'
-用法：bash install.sh [--username 用户] [--password 面板密码] [--panel-port 18181] [--ss-port 80] [--ss-method aes-256-gcm] [--ss-password wochiniming]
-已有 x-ui：不重装、不修改面板账户，只更新指定端口 SS 及出口模板。
-诊断日志：/root/x-ui-multiip-diagnostic.log（不会包含 SS 密码或完整链接）
-EOF
+WORK="$(mktemp -d /tmp/xui-install.XXXXXXXX)"
+STAMP="$(date -u +%Y%m%d-%H%M%S)"
+BACKUP="/root/x-ui-reinstall-backup-$STAMP"
+LOG=/root/x-ui-multiip-diagnostic.log
+COMMITTED=0
+MUTATED=0
+ORIGINAL_SERVICE=0
+[[ $EUID -eq 0 ]] || { echo '请以 root 身份运行' >&2; exit 1; }
+for n in PANEL_PORT SS_PORT; do v="${!n}"; [[ "$v" =~ ^[0-9]+$ ]] && ((10#$v>0 && 10#$v<=65535)) || { echo "$n 无效" >&2; exit 1; }; done
+[[ "$PANEL_PORT" != "$SS_PORT" ]] || { echo '面板端口不能与 SS 端口相同' >&2; exit 1; }
+[[ "$PANEL_USER" != *$'\n'* && "$PANEL_PASS" != *$'\n'* && "$SS_PASS" != *$'\n'* ]] || { echo '账号密码不能包含换行符' >&2; exit 1; }
+command -v apt-get >/dev/null || { echo '目前仅支持 Debian/Ubuntu apt 系统' >&2; exit 1; }
+ARCH="$(uname -m)"
+case "$ARCH" in x86_64|amd64) XUI_ARCH=amd64; XRAY_ARCH=64;; aarch64|arm64) XUI_ARCH=arm64; XRAY_ARCH=arm64-v8a;; *) echo "不支持的架构: $ARCH" >&2; exit 1;; esac
+mkdir -p "$BACKUP"
+report() {
+  {
+    echo '=== x-ui/Xray 诊断（不含密码和 SS URI） ==='
+    date -Is
+    echo '-- 服务 --'; systemctl is-active x-ui || :
+    echo '-- 核心版本 --'; /usr/local/x-ui/bin/xray-linux-${XUI_ARCH} version 2>&1 | head -n 3 || :
+    echo '-- 进程 --'; pgrep -af '/usr/local/x-ui/bin/xray|xray-linux' 2>/dev/null | sed -E 's/ -config .*/ [config omitted]/' || :
+    echo '-- 监听端口 --'; ss -H -lntup 2>/dev/null | awk -v p=":${SS_PORT}" '$5 ~ (p"$") {print $1, $5}' || :
+    echo '-- Xray 语法验证 --';
+    if [[ -s "$WORK/validation.json" && -x /usr/local/x-ui/bin/xray-linux-${XUI_ARCH} ]]; then
+      /usr/local/x-ui/bin/xray-linux-${XUI_ARCH} run -test -config "$WORK/validation.json" 2>&1 | head -n 25 || :
+    fi
+    echo '-- x-ui 最近日志（过滤密码及 URL） --';
+    journalctl -u x-ui -n 35 --no-pager -o cat 2>/dev/null | sed -E 's#ss://[^ ]+#[SS-URI-REDACTED]#g;s/(password|passwd|token|secret)[=:][^ ,]+/\1=[REDACTED]/Ig' || :
+    echo '-- 备份目录 --'; echo "$BACKUP"
+  } > "$LOG"
 }
-while (($#)); do
-  case "$1" in
-    -h|--help) usage;exit 0;;
-    --username|--password|--panel-port|--ss-port|--ss-method|--ss-password)
-      (($# >= 2)) || fail "$1 缺少参数值"
-      case "$1" in
-        --username) XUI_USERNAME="$2";; --password) XUI_PASSWORD="$2";;
-        --panel-port) XUI_PANEL_PORT="$2";; --ss-port) SS_PORT="$2";;
-        --ss-method) SS_METHOD="$2";; --ss-password) SS_PASSWORD="$2";;
-      esac; shift 2;;
-    *) fail "未知参数：$1";;
-  esac
-done
-[[ $EUID -eq 0 ]] || fail '必须 root 运行'
-for p in "$SS_PORT" "$XUI_PANEL_PORT"; do
-  [[ "$p" =~ ^[0-9]{1,5}$ ]] || fail "端口无效: $p"
-  (( 10#$p>=1 && 10#$p<=65535 )) || fail "端口越界: $p"
-done
-[[ "$SS_PORT" != "$XUI_PANEL_PORT" ]] || fail 'SS 端口不能与面板端口相同'
-case "$SS_METHOD" in aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305) ;; *) fail '加密方式不支持';; esac
-[[ -n "$SS_PASSWORD" ]] || fail 'SS 密码不能为空'
-export SS_PORT SS_METHOD SS_PASSWORD
-package_install(){
-  if command -v apt-get >/dev/null; then
-    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
-  elif command -v dnf >/dev/null; then dnf install -y "$@"
-  elif command -v yum >/dev/null; then yum install -y "$@"
-  else fail "请手动安装软件包: $*"; fi
-}
-for c in curl python3 ip ss systemctl; do
-  if ! command -v "$c" >/dev/null 2>&1; then
-    case "$c" in ip|ss) package_install iproute2;; *) package_install "$c";; esac
+rollback() {
+  code=$?
+  trap - ERR EXIT
+  if (( code != 0 && COMMITTED == 0 && MUTATED == 1 )); then
+    echo "[ERROR] 安装失败，尝试恢复旧版。备份: $BACKUP" >&2
+    report || :
+    systemctl stop x-ui >/dev/null 2>&1 || :
+    rm -rf /usr/local/x-ui
+    if [[ -d "$BACKUP/x-ui" ]]; then cp -a "$BACKUP/x-ui" /usr/local/x-ui; fi
+    if [[ -d "$BACKUP/etc-x-ui" ]]; then rm -rf /etc/x-ui; cp -a "$BACKUP/etc-x-ui" /etc/x-ui; fi
+    if [[ -f "$BACKUP/x-ui.service" ]]; then cp -a "$BACKUP/x-ui.service" /etc/systemd/system/x-ui.service; else rm -f /etc/systemd/system/x-ui.service; fi
+    if [[ -f "$BACKUP/x-ui-cli" ]]; then cp -a "$BACKUP/x-ui-cli" /usr/bin/x-ui; else rm -f /usr/bin/x-ui; fi
+    systemctl daemon-reload || :
+    if (( ORIGINAL_SERVICE )); then systemctl restart x-ui || :; fi
+    echo "[ERROR] 诊断日志: $LOG" >&2
+    cat "$LOG" >&2 || :
+  elif (( code != 0 )); then
+    echo "[ERROR] 安装尚未修改旧安装，退出码: $code" >&2
   fi
-done
-mapfile -t IPS < <(ip -o -4 addr show scope global | python3 -c '
-import sys,ipaddress
-s=set()
-for ln in sys.stdin:
-    p=ln.split()
-    if len(p)>3 and p[2]=="inet":
-        a=ipaddress.ip_interface(p[3]).ip
-        if a.is_global:s.add(str(a))
-print("\n".join(sorted(s,key=lambda x:int(ipaddress.ip_address(x)))))')
-((${#IPS[@]})) || fail '网卡没有检测到公网 IPv4'
-printf '检测到 %d 个公网 IP: %s\n' "${#IPS[@]}" "${IPS[*]}"
-mkdir -p "$DIAGDIR"
+  rm -rf "$WORK"
+  exit "$code"
+}
+trap rollback ERR EXIT
+
+echo '[1/7] 安装依赖并检测公网 IP'
+apt-get update -qq
+apt-get install -y -qq curl ca-certificates unzip tar python3 iproute2 procps >/dev/null
+mapfile -t IPS < <(ip -o -4 addr show scope global | python3 -c 'import sys,ipaddress; a=set();[(a.add(x.split()[3].split("/")[0])) for x in sys.stdin]; print("\n".join(sorted((x for x in a if ipaddress.ip_address(x).is_global),key=lambda s:tuple(map(int,s.split("."))))))')
+((${#IPS[@]})) || { echo '网卡没有检测到公网 IPv4' >&2; exit 1; }
+printf '检测到 %s 个公网 IP: %s\n' "${#IPS[@]}" "${IPS[*]}"
 for addr in "${IPS[@]}"; do
-  actual=$(curl -4fsS --interface "$addr" --connect-timeout 4 --max-time 10 https://api.ipify.org 2>/dev/null || true)
-  if [[ "$actual" == "$addr" ]];then log "出站源 IP 测试通过: $addr";
-  else log "警告: $addr 出站检查失败，结果 ${actual:-无}";fi
+  ext="$(curl -4fsS --interface "$addr" --connect-timeout 4 --max-time 10 https://api.ipify.org || :)"
+  [[ "$ext" == "$addr" ]] || { echo "[ERROR] $addr 源地址公网测试失败（返回 ${ext:-空}），终止以避免不可用节点" >&2; exit 1; }
+  echo "源地址测试通过: $addr"
 done
-if [[ ! -x /usr/local/x-ui/x-ui ]]; then
-  log '没有检测到 x-ui，安装 vaxilu/x-ui 0.3.2'
-  for c in wget tar unzip; do command -v "$c" >/dev/null 2>&1 || package_install "$c";done
-  WORKDIR=$(mktemp -d)
-  curl -fsSL --retry 3 https://raw.githubusercontent.com/vaxilu/x-ui/master/install.sh -o "$WORKDIR/xui.sh"
-  printf 'y\n%s\n%s\n%s\n' "$XUI_USERNAME" "$XUI_PASSWORD" "$XUI_PANEL_PORT" | bash "$WORKDIR/xui.sh" 0.3.2
-  [[ -x /usr/local/x-ui/x-ui ]] || fail 'x-ui 主程序安装失败'
-  /usr/local/x-ui/x-ui setting -username "$XUI_USERNAME" -password "$XUI_PASSWORD"
-  /usr/local/x-ui/x-ui setting -port "$XUI_PANEL_PORT"
-  systemctl restart x-ui
-  for i in {1..20}; do
-    curl -fsS --max-time 2 "http://127.0.0.1:${XUI_PANEL_PORT}/" -o /dev/null 2>/dev/null && break
-    sleep 1
-  done
-  WORKDIR=${WORKDIR:-$(mktemp -d)}
-  cookie="$WORKDIR/cookie"
-  resp=$(curl -fsS --cookie-jar "$cookie" --data-urlencode "username=$XUI_USERNAME" --data-urlencode "password=$XUI_PASSWORD" "http://127.0.0.1:${XUI_PANEL_PORT}/login")
-  [[ "$resp" == *'"success":true'* || "$resp" == *'"success": true'* ]] || fail '首次安装后登录 API 失败'
-  settings=$(python3 -c 'import json,os;print(json.dumps(dict(method=os.environ["SS_METHOD"],password=os.environ["SS_PASSWORD"],network="tcp,udp")))')
-  resp=$(curl -fsS --cookie "$cookie" -X POST "http://127.0.0.1:${XUI_PANEL_PORT}/xui/inbound/add" \
-    --data-urlencode up=0 --data-urlencode down=0 --data-urlencode total=0 \
-    --data-urlencode remark=independent-ip --data-urlencode enable=true \
-    --data-urlencode expiryTime=0 --data-urlencode listen= \
-    --data-urlencode "port=$SS_PORT" --data-urlencode protocol=shadowsocks \
-    --data-urlencode "settings=$settings" \
-    --data-urlencode 'streamSettings={"network":"tcp","security":"none","tcpSettings":{"acceptProxyProtocol":false,"header":{"type":"none"}}}' \
-    --data-urlencode 'sniffing={"enabled":true,"destOverride":["http","tls"]}')
-  [[ "$resp" == *'"success":true'* || "$resp" == *'"success": true'* ]] || fail '创建 SS 入站失败'
-else
-  log '保留已有 x-ui，仅修改目标 SS 入站和 Xray 模板'
-fi
-[[ -f "$DB" ]] || fail "数据库不存在: $DB"
-mkdir -p /root/x-ui-backups
-BACKUP="/root/x-ui-backups/x-ui-$(date +%Y%m%d-%H%M%S)-$$.db"
-python3 - "$DB" "$BACKUP" <<'PY'
-import sqlite3,sys
-s=sqlite3.connect(sys.argv[1]);d=sqlite3.connect(sys.argv[2]);s.backup(d);d.close();s.close()
+
+echo '[2/7] 下载并验证安装包（此阶段不会卸载旧版）'
+curl -fL --retry 3 -o "$WORK/xui.tar.gz" "https://github.com/vaxilu/x-ui/releases/download/${XUI_VERSION}/x-ui-linux-${XUI_ARCH}.tar.gz"
+tar -tzf "$WORK/xui.tar.gz" | grep -qx 'x-ui/x-ui' || { echo 'x-ui 压缩包内容异常' >&2; exit 1; }
+tar -xzf "$WORK/xui.tar.gz" -C "$WORK"
+# Use github API to find current stable Xray release (latest non-prerelease).
+curl -fLsS --retry 3 https://api.github.com/repos/XTLS/Xray-core/releases/latest -o "$WORK/release.json"
+XRAY_VERSION="$(python3 - "$WORK/release.json" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1])); print(x['tag_name'])
 PY
-log "已备份数据库: $BACKUP"
+)"
+[[ "$XRAY_VERSION" == v* ]] || { echo '无法读取有效 Xray release' >&2; exit 1; }
+echo "准备安装 Xray $XRAY_VERSION"
+curl -fL --retry 3 -o "$WORK/xray.zip" "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${XRAY_ARCH}.zip"
+unzip -p "$WORK/xray.zip" xray > "$WORK/xray-new"
+chmod 755 "$WORK/xray-new"
+"$WORK/xray-new" version | head -n 1
+
+# Backup existing installation fully before replacing anything.
+echo '[3/7] 备份并移除旧面板及旧数据库'
+systemctl is-active --quiet x-ui && ORIGINAL_SERVICE=1 || :
+[[ ! -d /usr/local/x-ui ]] || cp -a /usr/local/x-ui "$BACKUP/x-ui"
+[[ ! -d /etc/x-ui ]] || cp -a /etc/x-ui "$BACKUP/etc-x-ui"
+[[ ! -f /etc/systemd/system/x-ui.service ]] || cp -a /etc/systemd/system/x-ui.service "$BACKUP/x-ui.service"
+[[ ! -f /usr/bin/x-ui ]] || cp -a /usr/bin/x-ui "$BACKUP/x-ui-cli"
+MUTATED=1
+systemctl stop x-ui >/dev/null 2>&1 || :
+systemctl disable x-ui >/dev/null 2>&1 || :
+rm -rf /usr/local/x-ui /etc/x-ui
+mkdir -p /usr/local/x-ui /etc/x-ui
+cp -a "$WORK/x-ui/." /usr/local/x-ui/
+install -m755 "$WORK/xray-new" "/usr/local/x-ui/bin/xray-linux-${XUI_ARCH}"
+chmod +x /usr/local/x-ui/x-ui
+cp /usr/local/x-ui/x-ui.service /etc/systemd/system/x-ui.service
+cp /usr/local/x-ui/x-ui.sh /usr/bin/x-ui
+chmod +x /usr/bin/x-ui
+systemctl daemon-reload
+
+# Ensure DB initializes using the panel binary, not guessed SQLite schema.
+echo '[4/7] 初始化新 x-ui 面板与 SS 入站'
+/usr/local/x-ui/x-ui setting -username "$PANEL_USER" -password "$PANEL_PASS"
+/usr/local/x-ui/x-ui setting -port "$PANEL_PORT"
+export SS_PORT SS_PASS SS_METHOD
+# x-ui 0.3.2 may initialize database on CLI setting, but assert existence.
+[[ -f "$DB" ]] || { echo "找不到数据库 $DB" >&2; exit 1; }
 python3 - "$DB" <<'PY'
-import os,sqlite3,json,sys
-port=int(os.environ['SS_PORT']);method=os.environ['SS_METHOD'];pw=os.environ['SS_PASSWORD']
-tmpl={
- 'api':{'services':['HandlerService','LoggerService','StatsService'],'tag':'api'},
- 'inbounds':[{'listen':'127.0.0.1','port':62789,'protocol':'dokodemo-door','settings':{'address':'127.0.0.1'},'tag':'api'}],
- 'outbounds':[{'protocol':'freedom','settings':{}},{'protocol':'blackhole','settings':{},'tag':'blocked'}],
- 'policy':{'system':{'statsInboundDownlink':True,'statsInboundUplink':True}},
- 'routing':{'rules':[{'inboundTag':['api'],'outboundTag':'api','type':'field'},
-                     {'ip':['geoip:private'],'outboundTag':'blocked','type':'field'},
-                     {'outboundTag':'blocked','protocol':['bittorrent'],'type':'field'}]},'stats':{}}
+import os,sys,sqlite3,json
+p=int(os.environ['SS_PORT']); pw=os.environ['SS_PASS']; method=os.environ['SS_METHOD']
 con=sqlite3.connect(sys.argv[1]);con.execute('BEGIN IMMEDIATE')
 try:
- rows=con.execute('SELECT id,protocol,settings FROM inbounds WHERE port=?',(port,)).fetchall()
- if len(rows)!=1 or rows[0][1]!='shadowsocks':raise RuntimeError(f'端口 {port} 不是唯一的 SS 入站（查到 {len(rows)} 条）')
- ident,_,raw=rows[0];cfg=json.loads(raw);cfg.update(password=pw,method=method,network='tcp,udp')
- row=con.execute("SELECT id,value FROM settings WHERE key='xrayTemplateConfig' LIMIT 1").fetchone()
- template=json.loads(row[1]) if row else tmpl
- if not template.get('outbounds') or template['outbounds'][0].get('protocol')!='freedom':raise RuntimeError('第一个出站不是 freedom，拒绝自动修改')
- template['outbounds'][0]['sendThrough']='origin'
- con.execute('UPDATE inbounds SET settings=?,listen=? WHERE id=?',(json.dumps(cfg,ensure_ascii=False),'',ident))
- payload=json.dumps(template,ensure_ascii=False)
- if row:con.execute('UPDATE settings SET value=? WHERE id=?',(payload,row[0]))
- else:con.execute('INSERT INTO settings(key,value) VALUES (?,?)',('xrayTemplateConfig',payload))
- con.commit()
-except:con.rollback();raise
-finally:con.close()
-print('已更新 SS 密码、全网卡监听、origin 出站模板（密码不写入日志）')
+    cols=[row[1] for row in con.execute('PRAGMA table_info(inbounds)')]
+    # Handle legacy schema with column introspection, avoid guessed positional inserts.
+    payload={'user_id':1,'up':0,'down':0,'total':0,'remark':'multiip-ss','enable':1,
+             'expiry_time':0,'listen':'','port':p,'protocol':'shadowsocks',
+             'settings':json.dumps({'method':method,'password':pw,'network':'tcp,udp'},separators=(',',':')),
+             'stream_settings':'{}','tag':f'inbound-{p}',
+             'sniffing':json.dumps({'enabled':False,'destOverride':['http','tls']},separators=(',',':'))}
+    use={k:v for k,v in payload.items() if k in cols}
+    if not {'port','protocol','settings','enable'} <= set(use):raise RuntimeError(f'未知数据库结构: {cols}')
+    con.execute(f'INSERT INTO inbounds ({",".join(use)}) VALUES ({",".join("?" for _ in use)})',tuple(use.values()))
+    template={'api':{'services':['HandlerService','LoggerService','StatsService'],'tag':'api'},
+      'inbounds':[{'listen':'127.0.0.1','port':62789,'protocol':'dokodemo-door','settings':{'address':'127.0.0.1'},'tag':'api'}],
+      'outbounds':[{'protocol':'freedom','sendThrough':'origin','settings':{},'tag':'direct'},
+                  {'protocol':'blackhole','settings':{},'tag':'blocked'}],
+      'routing':{'rules':[{'inboundTag':['api'],'outboundTag':'api','type':'field'},
+                            {'ip':['geoip:private'],'outboundTag':'blocked','type':'field'},
+                            {'outboundTag':'blocked','protocol':['bittorrent'],'type':'field'}]},
+      'policy':{'system':{'statsInboundDownlink':True,'statsInboundUplink':True}},'stats':{}}
+    con.execute("DELETE FROM settings WHERE key='xrayTemplateConfig'")
+    con.execute('INSERT INTO settings(key,value) VALUES(?,?)',('xrayTemplateConfig',json.dumps(template,separators=(',',':'))))
+    con.commit()
+except: con.rollback();raise
+finally: con.close()
 PY
-# The bundled Xray 1.4.2 does not recognize sendThrough="origin".
-# Install a recent Xray-core binary before restarting the panel.
-upgrade_xray_core(){
-  local arch asset target temp old
-  arch=$(uname -m)
-  case "$arch" in
-    x86_64|amd64) asset='Xray-linux-64.zip'; target='/usr/local/x-ui/bin/xray-linux-amd64';;
-    aarch64|arm64) asset='Xray-linux-arm64-v8a.zip'; target='/usr/local/x-ui/bin/xray-linux-arm64';;
-    *) fail "不支持自动更新 Xray 的架构: $arch";;
-  esac
-  command -v unzip >/dev/null 2>&1 || package_install unzip
-  temp=$(mktemp -d)
-  log "下载 Xray-core 最新正式版: $asset"
-  if ! curl -fLsS --retry 3 --connect-timeout 10 --max-time 180 \
-    "https://github.com/XTLS/Xray-core/releases/latest/download/${asset}" -o "$temp/xray.zip"; then
-    rm -rf "$temp"; fail 'Xray 核心下载失败，未修改原核心'
-  fi
-  if ! unzip -p "$temp/xray.zip" xray > "$temp/xray"; then
-    rm -rf "$temp"; fail 'Xray 安装包内没有 xray 文件'
-  fi
-  chmod 755 "$temp/xray"
-  "$temp/xray" version | head -n 1
-  cat > "$temp/origin-test.json" <<'JSON'
-{"inbounds":[],"outbounds":[{"protocol":"freedom","sendThrough":"origin","settings":{}}]}
-JSON
-  if ! (cd /usr/local/x-ui/bin && "$temp/xray" run -test -config "$temp/origin-test.json") > "$temp/test.log" 2>&1; then
-    cat "$temp/test.log" >&2
-    rm -rf "$temp"; fail '下载的 Xray 不支持 origin，原核心未修改'
-  fi
-  old="${target}.bak.$(date +%Y%m%d%H%M%S)"
-  if [[ -f "$target" ]]; then cp -a "$target" "$old"; log "原 Xray 核心备份: $old"; fi
-  install -m 755 "$temp/xray" "$target"
-  rm -rf "$temp"
-  log '已替换 Xray 核心，origin 配置预检通过'
-}
-upgrade_xray_core
-# Create links with actual DB credentials; never include secrets in diagnostic file.
-python3 - "$DB" "$SS_PORT" "${IPS[@]}" <<'PY'
-import sys,sqlite3,json,base64,urllib.parse,os
-con=sqlite3.connect(sys.argv[1]);port=int(sys.argv[2]);ips=sys.argv[3:]
-row=con.execute("SELECT settings FROM inbounds WHERE port=? AND protocol='shadowsocks'",(port,)).fetchone()
-if not row:raise SystemExit('数据库缺少 SS 节点')
-s=json.loads(row[0]);pw=s['password'];method=s['method']
-token=base64.urlsafe_b64encode((method+':'+pw).encode()).decode().rstrip('=')
-links=[];nodes=[]
-for i,ip in enumerate(ips,1):
- name=f'美国{i:02d}'
- links.append(f'ss://{token}@{ip}:{port}#{urllib.parse.quote(name)}')
- nodes.append(dict(name=name,type='ss',server=ip,port=port,cipher=method,password=pw,udp=True))
-with open('/root/multiip-ss-links.txt','w') as f:f.write('\n'.join(links)+'\n')
-with open('/root/multiip-ss-clash.yaml','w') as f:
- f.write('proxies:\n')
- for n in nodes:
-  f.write('  - name: '+json.dumps(n['name'],ensure_ascii=False)+'\n')
-  for k in ('type','server','port','cipher','password','udp'):
-   f.write('    '+k+': '+json.dumps(n[k],ensure_ascii=False)+'\n')
-print('\n====== SS 节点链接（含密码，请勿公开）======')
-for i,s in enumerate(links,1):print(f'美国{i:02d}: {s}')
-print('=========================================')
+
+# Check core accepts the entire config before starting service.
+echo '[5/7] 校验 Xray 配置'
+python3 - "$DB" "$WORK/validation.json" <<'PY'
+import sqlite3,json,sys
+con=sqlite3.connect(sys.argv[1]); row=con.execute("SELECT value FROM settings WHERE key='xrayTemplateConfig'").fetchone(); cfg=json.loads(row[0]);
+for (port,proto,sett,listen,tag,stream,sniff) in con.execute('SELECT port,protocol,settings,listen,tag,stream_settings,sniffing FROM inbounds WHERE enable=1'):
+    x={'port':port,'protocol':proto,'settings':json.loads(sett),'tag':tag or f'inbound-{port}'}
+    if listen:x['listen']=listen
+    if stream:x['streamSettings']=json.loads(stream)
+    if sniff:x['sniffing']=json.loads(sniff)
+    cfg['inbounds'].append(x)
+open(sys.argv[2],'w').write(json.dumps(cfg))
+PY
+"/usr/local/x-ui/bin/xray-linux-${XUI_ARCH}" run -test -config "$WORK/validation.json"
+
+echo '[6/7] 启动并检测 Xray、TCP/UDP 监听'
+systemctl enable x-ui >/dev/null
+systemctl restart x-ui
+sleep 3
+systemctl is-active --quiet x-ui || { echo 'x-ui 未运行'; exit 1; }
+# A panel can be active while its Xray process has crashed.
+pgrep -f 'xray-linux-' >/dev/null || { echo '[ERROR] Xray 进程未启动'; exit 1; }
+ss -H -lnt "( sport = :${SS_PORT} )" | grep -q . || { echo '[ERROR] TCP ${SS_PORT} 未监听'; exit 1; }
+ss -H -lnu "( sport = :${SS_PORT} )" | grep -q . || { echo '[ERROR] UDP ${SS_PORT} 未监听'; exit 1; }
+
+# Only write links after service actually starts.
+echo '[7/7] 输出 SS 节点与 OpenClash YAML'
+# pass IPs as argv (stdin is used by the python program itself)
+python3 - "${IPS[@]}" <<'PY'
+import sys,os,json,base64,urllib.parse
+ips=sys.argv[1:]; port=int(os.environ['SS_PORT']); pw=os.environ['SS_PASS']; method=os.environ['SS_METHOD']
+creds=base64.urlsafe_b64encode(f'{method}:{pw}'.encode()).decode().rstrip('=')
+with open('/root/multiip-ss-links.txt','w') as a,open('/root/multiip-ss-clash.yaml','w') as b:
+    b.write('proxies:\n')
+    for i,ip in enumerate(ips,1):
+        name=f'美国{i:02d}'
+        a.write(f'{name}: ss://{creds}@{ip}:{port}#{urllib.parse.quote(name)}\n')
+        node={'name':name,'type':'ss','server':ip,'port':port,'cipher':method,'password':pw,'udp':True}
+        b.write('  - '+json.dumps(node,ensure_ascii=False,separators=(',',':'))+'\n')
 PY
 chmod 600 /root/multiip-ss-links.txt /root/multiip-ss-clash.yaml
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
- ufw allow "${SS_PORT}/tcp" >/dev/null && ufw allow "${SS_PORT}/udp" >/dev/null
+  ufw allow "${SS_PORT}/tcp" >/dev/null; ufw allow "${SS_PORT}/udp" >/dev/null; ufw allow "${PANEL_PORT}/tcp" >/dev/null
 fi
-systemctl restart x-ui
-# Generate a sanitized report from runtime state and an Xray config-test based on DB.
-# The synthesized file contains SS secrets and is chmod 600; never print it.
-collect_report(){
-  {
-    echo "=== x-ui / Xray 诊断（可发给技术支持；不含账号、密码、SS 链接） ==="
-    date -Is
-    echo "检测到的 IP 数量: ${#IPS[@]}"
-    echo "SS 端口: $SS_PORT"
-    echo "数据库备份: $BACKUP"
-    echo '--- x-ui 服务 ---'
-    systemctl is-active x-ui || true
-    echo '--- Xray 进程（只列名称） ---'
-    pgrep -a -f '[/]xray-linux|[/]xray run|[/]xray -config' | sed -E 's@/[^ ]*/xray[^ ]*@xray@g' || true
-    echo '--- 实际端口监听 ---'
-    ss -H -lntup | awk -v p="$SS_PORT" '$5 ~ (":" p "$") {print}' | sed -E 's/users:\(\([^)]*\)\)/users:(hidden)/g' || true
-    echo '--- 数据库结构与入站状态（不输出 settings） ---'
-    python3 - "$DB" "$SS_PORT" <<'PY'
-import sqlite3,sys,json
-c=sqlite3.connect(sys.argv[1]);p=int(sys.argv[2]);
-for row in c.execute('SELECT id,port,protocol,enable,listen,settings FROM inbounds WHERE port=?',(p,)):
- i,port,proto,en,listen,raw=row
- try:s=json.loads(raw);network=s.get('network','(未设)');method=s.get('method','(未设)')
- except Exception:network=method='JSON ERROR'
- print('id:',i,'port:',port,'protocol:',proto,'enable:',en,'listen:',repr(listen),'network:',network,'method:',method,'password_set:',bool(s.get('password')))
-for k,v in c.execute("SELECT key,value FROM settings WHERE key in ('xrayTemplateConfig','xrayState')"):
- print('setting:',k, 'present:',bool(v),'value:' if k=='xrayState' else 'length:',v if k=='xrayState' else len(v))
-c.close()
-PY
-    echo '--- 核心文件与版本 ---'
-    find /usr/local/x-ui/bin -maxdepth 1 -type f -name 'xray*' -printf '%f %s bytes\n' 2>/dev/null || true
-    XRAY=$(find /usr/local/x-ui/bin -maxdepth 1 -type f -name 'xray-linux-*' | head -n1)
-    if [[ -n "$XRAY" ]]; then
-      "$XRAY" version 2>&1 | head -n 4 || true
-    else
-      echo '未找到 Xray 可执行文件'
-    fi
-    echo '--- Xray 配置语法测试（基于数据库合成，完整配置仅在本机） ---'
-    if [[ -n "$XRAY" ]]; then
-      python3 - "$DB" "$DIAGDIR/xray-check.json" <<'PY'
-import sqlite3,sys,json
-c=sqlite3.connect(sys.argv[1]);r=c.execute("SELECT value FROM settings WHERE key='xrayTemplateConfig'").fetchone()
-t=json.loads(r[0]) if r else {}
-t.setdefault('inbounds',[])
-for port,proto,listen,settings,stream,sniff,enable in c.execute('SELECT port,protocol,listen,settings,stream_settings,sniffing,enable FROM inbounds'):
- if not enable:continue
- e={'port':port,'protocol':proto,'settings':json.loads(settings),'tag':f'inbound-{port}'}
- if listen:e['listen']=listen
- if stream:e['streamSettings']=json.loads(stream)
- if sniff:e['sniffing']=json.loads(sniff)
- t['inbounds'].append(e)
-c.close()
-with open(sys.argv[2],'w') as f:json.dump(t,f)
-PY
-      chmod 600 "$DIAGDIR/xray-check.json"
-      (cd /usr/local/x-ui/bin && "$XRAY" -test -config "$DIAGDIR/xray-check.json") 2>&1 | sed -E 's/wochiniming/[REDACTED]/g' | tail -n 30 || true
-    fi
-    echo '--- x-ui 最近 60 行日志（过滤常见密钥） ---'
-    journalctl -u x-ui -n 60 --no-pager -o cat 2>&1 \
-      | sed -E 's/(password|passwd|token|secret|uuid|authorization)[=:][^ ,}]+/\1=[REDACTED]/Ig' \
-      | sed -E 's/wochiniming/[REDACTED]/g' || true
-    echo '--- 完毕 ---'
-  } > "$REPORT" 2>&1
-  chmod 600 "$REPORT"
-}
-READY=0
-for i in {1..12}; do
-  if pgrep -f '[/]xray-linux|[/]xray run|[/]xray -config' >/dev/null && \
-     ss -H -lnt | awk -v p="$SS_PORT" '$4 ~ (":"p"$"){ok=1}END{exit !ok}' && \
-     ss -H -lnu | awk -v p="$SS_PORT" '$4 ~ (":"p"$"){ok=1}END{exit !ok}'; then READY=1;break; fi
-  sleep 1
-done
-collect_report
-if ((READY));then
-  log "Xray 进程存在，TCP/UDP :$SS_PORT 已监听（未验证远端代理连通性）"
-  log '诊断日志: /root/x-ui-multiip-diagnostic.log'
-  log 'SS 链接: /root/multiip-ss-links.txt'
-  log 'OpenClash YAML: /root/multiip-ss-clash.yaml'
-  echo '提示：每个 IP 的 TCP 出口仍需客户端实际验证；origin 对 UDP 不保证同源。'
-else
-  echo "[ERROR] Xray 未启动或 TCP/UDP 端口 $SS_PORT 未全部监听。" >&2
-  echo '[ERROR] 诊断日志位于 /root/x-ui-multiip-diagnostic.log' >&2
-  echo '[ERROR] 将下面的内容复制给我（发送前仍建议检查是否涉及隐私）：' >&2
-  cat "$REPORT"
-  exit 1
-fi
+COMMITTED=1
+report
+printf '\n===== 已启动：SS 链接（包含密码，勿公开）=====\n'
+cat /root/multiip-ss-links.txt
+printf '\n面板端口: %s；SS 端口: %s；Xray: %s\n' "$PANEL_PORT" "$SS_PORT" "$XRAY_VERSION"
+printf 'OpenClash: /root/multiip-ss-clash.yaml\n诊断日志: %s\n旧版备份: %s\n' "$LOG" "$BACKUP"
+echo '注意：TCP/UDP 端口监听成功不保证 UDP 源地址按对应公网 IP 出站；请用客户端分别验证。'
