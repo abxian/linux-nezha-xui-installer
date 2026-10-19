@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# BUILD: MULTIIP-ARCHIVE-FIX-20261019-R2
 # Fresh legacy x-ui 0.3.2 + recent Xray; multi-IP one-port Shadowsocks.
 set -Eeuo pipefail
 umask 077
@@ -85,6 +86,7 @@ PY_JSON
 }
 trap rollback ERR EXIT
 
+echo '[installer] BUILD: MULTIIP-ARCHIVE-FIX-20261019-R2'
 echo '[1/7] 安装依赖并检测公网 IP'
 apt-get update -qq
 apt-get install -y -qq curl ca-certificates unzip tar python3 iproute2 procps >/dev/null
