@@ -1,4 +1,65 @@
-# Linux x-ui + Shadowsocks 独立 IP 一键安装
+# Linux 独立 IP 节点一键安装
+
+本仓库提供两套相互独立的一键脚本：
+
+- `install.sh`：旧版 x-ui + Shadowsocks，默认节点端口 `80`
+- `install-3xui-reality.sh`：新版 3x-ui + VLESS REALITY，默认节点端口 `443`
+
+两套面板都使用 `/usr/local/x-ui` 和 `x-ui` 服务，不能同时安装在同一台服务器。两个脚本检测到已有 x-ui/3x-ui 时都会停止，避免覆盖现有节点。
+
+## 3x-ui + VLESS REALITY 443
+
+直接执行下面这一条命令，无需附加参数：
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/abxian/linux-nezha-xui-installer/main/install-3xui-reality.sh)"
+```
+
+默认配置：
+
+| 配置 | 默认值 |
+|---|---|
+| 3x-ui 账号 | `wochiniming` |
+| 3x-ui 密码 | `wochiniming` |
+| 3x-ui 面板端口 | `18181` |
+| 3x-ui 面板路径 | `/reality/` |
+| 节点协议 | `VLESS + REALITY` |
+| 节点端口 | `443/tcp` |
+| Flow | `xtls-rprx-vision` |
+| REALITY SNI/目标站点 | `www.cloudflare.com` |
+| UUID、X25519 密钥、short ID | 自动随机生成 |
+
+安装成功后会在终端显示 VLESS 链接，并保存：
+
+- `/root/independent-ip-reality.txt`：面板入口、账号密码和完整 `vless://` 链接
+- `/root/independent-ip-reality.yaml`：可放入 Mihomo/OpenClash `proxies:` 的节点 YAML
+
+把 `vless://...` 直接导入支持 REALITY 的路由器客户端即可；使用 OpenClash 时，内核必须使用支持 VLESS REALITY 的 Mihomo 版本。主机防火墙会在检测到已启用的 UFW/firewalld 时放行 `18181/tcp` 和 `443/tcp`，云服务器安全组也需要放行这两个 TCP 端口。
+
+需要覆盖默认值时，可以使用参数版本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/abxian/linux-nezha-xui-installer/main/install-3xui-reality.sh | \
+  sudo bash -s -- \
+  --username admin \
+  --password 'CHANGE_ME' \
+  --panel-port 18181 \
+  --reality-port 443 \
+  --reality-sni www.cloudflare.com
+```
+
+脚本通过 [MHSanaei/3x-ui](https://github.com/MHSanaei/3x-ui) 官方安装器安装最新稳定版，并用当前面板 API 创建 REALITY 入站。面板本身默认使用 HTTP；固定弱口令与公开管理端口存在明显风险，至少应在云安全组限制 `18181/tcp` 只允许你的管理 IP 访问。REALITY 节点的 `443/tcp` 则需要对客户端开放。
+
+验证与卸载：
+
+```bash
+sudo systemctl status x-ui --no-pager
+sudo cat /root/independent-ip-reality.txt
+sudo cat /root/independent-ip-reality.yaml
+sudo x-ui uninstall
+```
+
+## x-ui + Shadowsocks 80
 
 为普通 Linux 服务器一次性安装：
 
@@ -97,3 +158,4 @@ x-ui 可运行 `x-ui uninstall`。卸载前请保留 `/root/independent-ip-node.
 ## 上游来源
 
 - x-ui：<https://github.com/vaxilu/x-ui>（固定 release `0.3.2`）
+- 3x-ui：<https://github.com/MHSanaei/3x-ui>（官方安装器选择最新稳定版）
