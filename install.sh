@@ -142,6 +142,42 @@ except:con.rollback();raise
 finally:con.close()
 print('已更新 SS 密码、全网卡监听、origin 出站模板（密码不写入日志）')
 PY
+# The bundled Xray 1.4.2 does not recognize sendThrough="origin".
+# Install a recent Xray-core binary before restarting the panel.
+upgrade_xray_core(){
+  local arch asset target temp old
+  arch=$(uname -m)
+  case "$arch" in
+    x86_64|amd64) asset='Xray-linux-64.zip'; target='/usr/local/x-ui/bin/xray-linux-amd64';;
+    aarch64|arm64) asset='Xray-linux-arm64-v8a.zip'; target='/usr/local/x-ui/bin/xray-linux-arm64';;
+    *) fail "不支持自动更新 Xray 的架构: $arch";;
+  esac
+  command -v unzip >/dev/null 2>&1 || package_install unzip
+  temp=$(mktemp -d)
+  log "下载 Xray-core 最新正式版: $asset"
+  if ! curl -fLsS --retry 3 --connect-timeout 10 --max-time 180 \
+    "https://github.com/XTLS/Xray-core/releases/latest/download/${asset}" -o "$temp/xray.zip"; then
+    rm -rf "$temp"; fail 'Xray 核心下载失败，未修改原核心'
+  fi
+  if ! unzip -p "$temp/xray.zip" xray > "$temp/xray"; then
+    rm -rf "$temp"; fail 'Xray 安装包内没有 xray 文件'
+  fi
+  chmod 755 "$temp/xray"
+  "$temp/xray" version | head -n 1
+  cat > "$temp/origin-test.json" <<'JSON'
+{"inbounds":[],"outbounds":[{"protocol":"freedom","sendThrough":"origin","settings":{}}]}
+JSON
+  if ! (cd /usr/local/x-ui/bin && "$temp/xray" run -test -config "$temp/origin-test.json") > "$temp/test.log" 2>&1; then
+    cat "$temp/test.log" >&2
+    rm -rf "$temp"; fail '下载的 Xray 不支持 origin，原核心未修改'
+  fi
+  old="${target}.bak.$(date +%Y%m%d%H%M%S)"
+  if [[ -f "$target" ]]; then cp -a "$target" "$old"; log "原 Xray 核心备份: $old"; fi
+  install -m 755 "$temp/xray" "$target"
+  rm -rf "$temp"
+  log '已替换 Xray 核心，origin 配置预检通过'
+}
+upgrade_xray_core
 # Create links with actual DB credentials; never include secrets in diagnostic file.
 python3 - "$DB" "$SS_PORT" "${IPS[@]}" <<'PY'
 import sys,sqlite3,json,base64,urllib.parse,os
