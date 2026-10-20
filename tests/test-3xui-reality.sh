@@ -104,12 +104,29 @@ curl() {
   case "$*" in
     *'/csrf-token'*) printf '{"success":true,"obj":"abcdefghijklmnopqrstuvwxyz0123456789_-ABCDE"}' ;;
     *'/login'*) printf '{"success":true}' ;;
-    *'/panel/api/inbounds/list'*) printf '{"success":true,"obj":[]}' ;;
+    *'/panel/api/inbounds/list'*)
+      if [[ -e "$mock_dir/inbound-created" ]]; then
+        jq -cn \
+          --arg uuid "$CLIENT_UUID" --arg privateKey "$REALITY_PRIVATE_KEY" \
+          --arg publicKey "$REALITY_PUBLIC_KEY" --arg shortId "$REALITY_SHORT_ID" \
+          '{success:true,obj:[{id:9,enable:true,remark:"independent-ip-reality",port:443,protocol:"vless",settings:({clients:[{id:$uuid,enable:true,flow:"xtls-rprx-vision"}]}|tojson),streamSettings:({network:"tcp",security:"reality",realitySettings:{target:"www.cloudflare.com:443",serverNames:["www.cloudflare.com"],privateKey:$privateKey,shortIds:[$shortId],settings:{publicKey:$publicKey}}}|tojson)}]}'
+      else
+        printf '{"success":true,"obj":[]}'
+      fi
+      ;;
     *'/panel/api/server/getNewX25519Cert'*)
       printf '{"success":true,"obj":{"privateKey":"%s","publicKey":"%s"}}' \
         "$REALITY_PRIVATE_KEY" "$REALITY_PUBLIC_KEY"
       ;;
-    *'/panel/api/inbounds/add'*) printf '{"success":true}' ;;
+    *'/panel/api/inbounds/add'*) touch "$mock_dir/inbound-created"; printf '{"success":true}' ;;
+    *'/panel/api/xray/update'*) touch "$mock_dir/xray-updated"; printf '{"success":true}' ;;
+    *'/panel/api/xray/'*)
+      if [[ -e "$mock_dir/xray-updated" ]]; then
+        printf '%s' '{"success":true,"obj":"{\"xraySetting\":{\"outbounds\":[{\"tag\":\"direct\",\"protocol\":\"freedom\",\"sendThrough\":\"origin\",\"settings\":{}}]},\"outboundTestUrl\":\"https://example.com/204\"}"}'
+      else
+        printf '%s' '{"success":true,"obj":"{\"xraySetting\":{\"outbounds\":[{\"tag\":\"direct\",\"protocol\":\"freedom\",\"settings\":{}}]},\"outboundTestUrl\":\"https://example.com/204\"}"}'
+      fi
+      ;;
     *) return 1 ;;
   esac
 }
@@ -135,7 +152,53 @@ grep -q '"flow":"xtls-rprx-vision"' "$mock_dir/curl.log"
 grep -q '"privateKey"' "$mock_dir/curl.log"
 grep -q '"shortIds"' "$mock_dir/curl.log"
 
+add_count_before=$(grep -c '/panel/api/inbounds/add' "$mock_dir/curl.log")
+# Used by the sourced installer's create_reality_inbound function.
+# shellcheck disable=SC2034
+RESUME_EXISTING=1
+create_reality_inbound
+add_count_after=$(grep -c '/panel/api/inbounds/add' "$mock_dir/curl.log")
+assert_eq "$add_count_before" "$add_count_after" 'safe resume reuses the exact managed inbound'
+
+ensure_direct_freedom_outbound
+grep -q '/panel/api/xray/update' "$mock_dir/curl.log"
+grep -q 'sendThrough' "$mock_dir/curl.log"
+grep -q 'origin' "$mock_dir/curl.log"
+
+is_public_ipv4 '8.8.8.8'
+if is_public_ipv4 '10.0.0.1' || is_public_ipv4 '100.64.0.1' || is_public_ipv4 '192.168.1.1' || is_public_ipv4 '203.0.113.1'; then
+  printf 'FAIL: private/reserved IPv4 accepted as public\n' >&2
+  exit 1
+fi
+
 unset -f curl systemctl port_in_use
+
+# shellcheck disable=SC2317,SC2329
+ip() {
+  printf '%s\n' \
+    '2: eth0    inet 8.8.8.8/24 brd 8.8.8.255 scope global eth0' \
+    '2: eth0    inet 9.9.9.9/24 brd 9.9.9.255 scope global secondary eth0'
+}
+# shellcheck disable=SC2317,SC2329
+curl() {
+  local previous='' argument
+  for argument in "$@"; do
+    if [[ "$previous" == '--interface' ]]; then
+      printf '%s' "$argument"
+      return 0
+    fi
+    previous="$argument"
+  done
+  return 1
+}
+PUBLIC_HOST=''
+PUBLIC_IPS=()
+collect_local_public_ips
+assert_eq '2' "${#PUBLIC_IPS[@]}" 'all local public IPv4 addresses detected'
+assert_eq '8.8.8.8' "${PUBLIC_IPS[0]}" 'public IPv4 addresses sorted'
+assert_eq '9.9.9.9' "${PUBLIC_IPS[1]}" 'second public IPv4 detected'
+verify_public_ip_sources
+unset -f curl ip
 
 grep -q "DEFAULT_XUI_PANEL_PORT='18181'" "$INSTALLER"
 grep -q "readonly DEFAULT_REALITY_PORT='443'" "$INSTALLER"
@@ -143,10 +206,15 @@ grep -q "DEFAULT_XUI_USERNAME='wochiniming'" "$INSTALLER"
 grep -q "DEFAULT_XUI_PASSWORD='wochiniming'" "$INSTALLER"
 grep -q 'MHSanaei/3x-ui/main/install.sh' "$INSTALLER"
 grep -q 'THREEXUI_INSTALLER_SOURCE_ONLY' "$INSTALLER"
+grep -q 'sendThrough:"origin"' "$INSTALLER"
+grep -q 'MULTIIP-REALITY-ORIGIN' "$INSTALLER"
+grep -q 'collect_local_public_ips' "$INSTALLER"
+grep -q 'public_exit=.*reality_proxy_probe' "$INSTALLER"
+grep -q '不符合独立 IP 同源出站要求' "$INSTALLER"
 
 if grep -Eiq 'nezhahq|NZ_CLIENT_SECRET|NZ_SERVER|NZ_TLS' "$INSTALLER"; then
   printf 'FAIL: Nezha functionality or credentials found in 3x-ui installer\n' >&2
   exit 1
 fi
 
-printf 'PASS: 3x-ui defaults, validation, REALITY API payload, URI, and execution modes\n'
+printf 'PASS: 3x-ui defaults, string/object API readback, direct origin outbound, multi-IP source checks, URI, and execution modes\n'
