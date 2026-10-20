@@ -20,7 +20,13 @@ COMMITTED=0
 MUTATED=0
 ORIGINAL_SERVICE=0
 [[ $EUID -eq 0 ]] || { echo '请以 root 身份运行' >&2; exit 1; }
-for n in PANEL_PORT SS_PORT; do v="${!n}"; [[ "$v" =~ ^[0-9]+$ ]] && ((10#$v>0 && 10#$v<=65535)) || { echo "$n 无效" >&2; exit 1; }; done
+for n in PANEL_PORT SS_PORT; do
+  v="${!n}"
+  if [[ ! "$v" =~ ^[0-9]+$ ]] || ((10#$v <= 0 || 10#$v > 65535)); then
+    echo "$n 无效" >&2
+    exit 1
+  fi
+done
 [[ "$PANEL_PORT" != "$SS_PORT" ]] || { echo '面板端口不能与 SS 端口相同' >&2; exit 1; }
 [[ "$PANEL_USER" != *$'\n'* && "$PANEL_PASS" != *$'\n'* && "$SS_PASS" != *$'\n'* ]] || { echo '账号密码不能包含换行符' >&2; exit 1; }
 command -v apt-get >/dev/null || { echo '目前仅支持 Debian/Ubuntu apt 系统' >&2; exit 1; }
@@ -211,8 +217,8 @@ sleep 3
 systemctl is-active --quiet x-ui || { echo 'x-ui 未运行'; exit 1; }
 # A panel can be active while its Xray process has crashed.
 pgrep -f 'xray-linux-' >/dev/null || { echo '[ERROR] Xray 进程未启动'; exit 1; }
-ss -H -lnt "( sport = :${SS_PORT} )" | grep -q . || { echo '[ERROR] TCP ${SS_PORT} 未监听'; exit 1; }
-ss -H -lnu "( sport = :${SS_PORT} )" | grep -q . || { echo '[ERROR] UDP ${SS_PORT} 未监听'; exit 1; }
+ss -H -lnt "( sport = :${SS_PORT} )" | grep -q . || { echo "[ERROR] TCP ${SS_PORT} 未监听"; exit 1; }
+ss -H -lnu "( sport = :${SS_PORT} )" | grep -q . || { echo "[ERROR] UDP ${SS_PORT} 未监听"; exit 1; }
 
 # Only write links after service actually starts.
 echo '[7/7] 输出 SS 节点与 OpenClash YAML'
