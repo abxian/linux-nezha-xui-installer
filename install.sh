@@ -140,7 +140,9 @@ chmod 755 "$WORK/xray-new"
 
 # Backup existing installation fully before replacing anything.
 echo '[3/7] 备份并移除旧面板及旧数据库'
-systemctl is-active --quiet x-ui && ORIGINAL_SERVICE=1 || :
+if systemctl is-active --quiet x-ui; then
+  ORIGINAL_SERVICE=1
+fi
 [[ ! -d /usr/local/x-ui ]] || cp -a /usr/local/x-ui "$BACKUP/x-ui"
 [[ ! -d /etc/x-ui ]] || cp -a /etc/x-ui "$BACKUP/etc-x-ui"
 [[ ! -f /etc/systemd/system/x-ui.service ]] || cp -a /etc/systemd/system/x-ui.service "$BACKUP/x-ui.service"
